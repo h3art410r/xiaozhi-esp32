@@ -1,0 +1,36 @@
+{
+  "id": "dev.box0.voicelink",
+  "name": "Box0 Voice Link",
+  "nameI18n": {
+    "zh-CN": "Box0 语音联动",
+    "en": "Box0 Voice Link"
+  },
+  "description": "Bridges BOX0 wireless-mic buttons to desktop hotkeys: M starts/stops WeChat voice input, RIGHT sends Enter.",
+  "descriptionI18n": {
+    "zh-CN": "将 BOX0 无线麦按键映射为桌面快捷键：M 键开始/停止微信语音输入（Ctrl+Win+Shift / ESC），右键发送 Enter。",
+    "en": "Bridges BOX0 wireless-mic buttons to desktop hotkeys: M starts/stops WeChat voice input, RIGHT sends Enter."
+  },
+  "version": "1.0.0",
+  "author": "box0",
+  "license": "GPL-3.0-only",
+  "runtime": "native",
+  "entry": "box0_voice_link",
+  "platforms": ["windows"],
+  "apiVersion": 1,
+  "capabilities": ["config.read"],
+  "kind": "utility",
+  "config": {
+    "startKeys": "CTRL+WIN+SHIFT",
+    "stopKeys": "ESC",
+    "enterKeys": "ENTER",
+    "port": 9125
+  },
+  "configSchema": {
+    "fields": [
+      { "key": "startKeys", "fieldType": "string", "label": "Start hotkey", "default": "CTRL+WIN+SHIFT" },
+      { "key": "stopKeys", "fieldType": "string", "label": "Stop key", "default": "ESC" },
+      { "key": "enterKeys", "fieldType": "string", "label": "Send key", "default": "ENTER" },
+      { "key": "port", "fieldType": "number", "label": "UDP port", "default": 9125, "min": 1024, "max": 65535 }
+    ]
+  }
+}

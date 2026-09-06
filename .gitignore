@@ -19,3 +19,11 @@ main/mmap_generate_emoji.h
 mmap_generate_*.h
 .clangd
 _spec/
+
+# PC companion tools build artifacts
+pc-tools/box0-sim/obj/
+pc-tools/box0-sim/box0_sim.exe
+pc-tools/box0-sim/SDL2.dll
+pc-tools/box0-sim/lvgl_sources.txt
+pc-tools/box0-sim/obj_files.txt
+pc-tools/box0-voice-link/box0_voice_link.dll
