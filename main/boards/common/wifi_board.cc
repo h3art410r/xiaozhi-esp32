@@ -107,10 +107,11 @@ void WifiBoard::TryWifiConnect() {
         esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
         WifiManager::GetInstance().StartStation();
     } else {
-        // No SSID configured, enter config mode
-        // Wait for the board version to be shown
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        StartWifiConfigMode();
+        // Hardcoded default WiFi for personal use
+        ssid_manager.AddSsid("iKuai-1024", "wanqing1002");
+        ESP_LOGI(TAG, "Starting WiFi connection attempt with hardcoded SSID");
+        esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
+        WifiManager::GetInstance().StartStation();
     }
 }
 
