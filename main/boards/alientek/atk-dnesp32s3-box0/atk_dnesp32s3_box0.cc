@@ -9,6 +9,9 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "box0_games.h"
+#include "box0_local_config.h"
+#include <ssid_manager.h>
 
 #include "i2c_device.h"
 #include <esp_log.h>
@@ -69,42 +72,12 @@ private:
     esp_timer_handle_t menu_timer_ = nullptr;
     bool menu_pending_ = true;
 
-    // Flappy game state
-    lv_obj_t* game_layer_ = nullptr;
-    lv_obj_t* bird_ = nullptr;
-    lv_obj_t* game_score_label_ = nullptr;
-    lv_obj_t* game_over_label_ = nullptr;
-    lv_timer_t* game_timer_ = nullptr;
-    lv_obj_t* pipe_top_[4] = {nullptr, nullptr, nullptr, nullptr};
-    lv_obj_t* pipe_bottom_[4] = {nullptr, nullptr, nullptr, nullptr};
-    float pipe_x_[4] = {0, 0, 0, 0};
-    float pipe_gap_y_[4] = {0, 0, 0, 0};
-    bool pipe_active_[4] = {false, false, false, false};
-    bool pipe_scored_[4] = {false, false, false, false};
-    float bird_y_ = 0;
-    float bird_vy_ = 0;
-    int game_score_ = 0;
-    bool game_active_ = false;
-    bool game_over_ = false;
+    // Games; logic lives in box0_games.h and is shared with the PC simulator
+    Box0GamePlatform game_platform_;
+    Box0Flappy flappy_game_;
+    Box0Dino dino_game_;
+    DisplayLockGuard* game_lock_ = nullptr;
 
-    // Dino game state
-    lv_obj_t* dino_layer_ = nullptr;
-    lv_obj_t* dino_ = nullptr;
-    lv_obj_t* dino_score_label_ = nullptr;
-    lv_obj_t* dino_over_label_ = nullptr;
-    lv_timer_t* dino_timer_ = nullptr;
-    lv_obj_t* cactus_[4] = {nullptr, nullptr, nullptr, nullptr};
-    float cactus_x_[4] = {0, 0, 0, 0};
-    int cactus_h_[4] = {0, 0, 0, 0};
-    bool cactus_active_[4] = {false, false, false, false};
-    float dino_y_ = 0;
-    float dino_vy_ = 0;
-    bool dino_on_ground_ = true;
-    int dino_score_ = 0;
-    int dino_frame_ = 0;
-    int dino_spawn_gap_ = 150;
-    bool dino_active_ = false;
-    bool dino_over_ = false;
 
     // Wireless mic (MicYou protocol) state
     lv_obj_t* mic_layer_ = nullptr;
@@ -120,6 +93,12 @@ private:
     uint8_t mic_rx_acc_[512];
     size_t mic_rx_len_ = 0;
     uint8_t mic_frame_buf_[800];
+    esp_ip4_addr_t mic_pc_ip_{};
+    std::atomic<int32_t> mic_level_{0};
+    lv_obj_t* mic_bars_[20] = {};
+    int mic_wave_hist_[20] = {};
+    lv_timer_t* mic_wave_timer_ = nullptr;
+    static constexpr int kMicVoicePort = 9125;
 
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
@@ -212,6 +191,17 @@ private:
                 power_save_timer_->SetEnabled(true);
             }
         });
+    }
+
+    // Personal default WiFi credentials (from box0_local_config.h, generated
+    // from box0_config.ini by flash_box0.bat) so the board connects without
+    // the manual provisioning flow.
+    void EnsureDefaultWifi() {
+        auto& ssid_manager = SsidManager::GetInstance();
+        if (ssid_manager.GetSsidList().empty()) {
+            ssid_manager.AddSsid(BOX0_WIFI_SSID, BOX0_WIFI_PASSWORD);
+            ESP_LOGI(TAG, "No saved WiFi credentials, using defaults from box0_config.ini");
+        }
     }
 
     void InitializePowerSaveTimer() {
@@ -714,7 +704,7 @@ private:
         DisplayLockGuard lock(display_);
         if (mic_status_label_ != nullptr) {
             lv_label_set_text(mic_status_label_, status);
-            lv_obj_set_style_text_color(mic_status_label_, streaming ? lv_color_hex(0xFF6B6B) : lv_color_hex(0xD5DBE1), 0);
+            lv_obj_set_style_text_color(mic_status_label_, streaming ? lv_color_hex(0x4ADE80) : lv_color_hex(0xD5DBE1), 0);
         }
     }
 
@@ -776,6 +766,7 @@ private:
             char pc_str[48];
             snprintf(pc_str, sizeof(pc_str), "PC: " IPSTR ":%u", IP2STR(&server_ip), (unsigned)server_port);
             MicSetPc(pc_str);
+            mic_pc_ip_ = server_ip;
         }
 
         // 2. TCP connect + protocol handshake
@@ -844,7 +835,7 @@ private:
 
         // 3. Main loop: keepalive pings when idle, PCM frames when streaming
         if (connected) {
-            MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected - M: start", mic_streaming_);
+            MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected", mic_streaming_);
         }
         int64_t last_ping_ms = 0;
         mic_rx_len_ = 0;
@@ -873,6 +864,13 @@ private:
                         pcm = mono.data();
                         nsamples = mono.size();
                     }
+                    int32_t peak = 0;
+                    for (size_t i = 0; i < nsamples; i++) {
+                        int32_t v = pcm[i];
+                        if (v < 0) { v = -v; }
+                        if (v > peak) { peak = v; }
+                    }
+                    mic_level_.store(peak);
                     size_t flen = MicBuildAudioFrame(mic_frame_buf_, sizeof(mic_frame_buf_),
                                                      (const uint8_t*)pcm, nsamples * sizeof(int16_t));
                     if (flen == 0 || MicSendAll(sock, mic_frame_buf_, flen) != 0) {
@@ -926,7 +924,56 @@ private:
             return;
         }
         mic_streaming_ = !mic_streaming_;
-        MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected - M: start", mic_streaming_);
+        MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected", mic_streaming_);
+        MicSignalPc(mic_streaming_ ? "VOICE_START" : "VOICE_STOP");
+    }
+
+    // Notify the PC-side voice_link helper over UDP so it can press the
+    // voice-input hotkey (start) / ESC (stop) / Enter (send) on the desktop.
+    void MicSignalPc(const char* msg) {
+        if (mic_pc_ip_.addr == 0) {
+            return;
+        }
+        int s = (int)socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s < 0) {
+            return;
+        }
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(kMicVoicePort);
+        sa.sin_addr.s_addr = mic_pc_ip_.addr;
+        sendto(s, msg, (int)strlen(msg), 0, (struct sockaddr*)&sa, sizeof(sa));
+        close(s);
+    }
+
+    static void MicWaveTickCb(lv_timer_t* timer) {
+        auto* self = static_cast<atk_dnesp32s3_box0*>(lv_timer_get_user_data(timer));
+        self->MicWaveTick();
+    }
+
+    void MicWaveTick() {
+        auto disp = lv_display_get_default();
+        int h = lv_display_get_vertical_resolution(disp);
+        int center_y = h - 56;
+        const int kMaxBar = 48;  // half-height; bars extend both ways from the center line
+        int32_t level = mic_level_.exchange(0);
+        int v = 0;
+        if (mic_streaming_) {
+            v = (int)(level * kMaxBar / 32767);
+            int decayed = mic_wave_hist_[19] * 3 / 4;  // smooth falloff
+            if (v < decayed) { v = decayed; }
+        }
+        memmove(mic_wave_hist_, mic_wave_hist_ + 1, sizeof(int) * 19);
+        mic_wave_hist_[19] = v;
+        for (int i = 0; i < 20; i++) {
+            if (mic_bars_[i] == nullptr) {
+                continue;
+            }
+            int bh = mic_wave_hist_[i] * 2 + 2;
+            lv_obj_set_size(mic_bars_[i], 7, bh);
+            lv_obj_set_pos(mic_bars_[i], 12 + i * 11, center_y - bh / 2);
+        }
     }
 
     void ShowMicPage() {
@@ -988,22 +1035,22 @@ private:
             }
             lv_obj_align(mic_status_label_, LV_ALIGN_TOP_MID, 0, 122);
 
-            lv_obj_t* hint1 = lv_label_create(mic_layer_);
-            lv_label_set_text(hint1, "M: Start/Stop");
-            lv_obj_set_style_text_color(hint1, lv_color_hex(0x8A939B), 0);
-            if (font != nullptr) {
-                lv_obj_set_style_text_font(hint1, font, 0);
+            // Live audio level waveform (updated by MicWaveTick while streaming)
+            for (int i = 0; i < 20; i++) {
+                mic_bars_[i] = lv_obj_create(mic_layer_);
+                lv_obj_set_size(mic_bars_[i], 7, 2);
+                lv_obj_set_pos(mic_bars_[i], 12 + i * 11, h - 57);
+                lv_obj_set_style_bg_color(mic_bars_[i], lv_color_hex(0x3B9EFF), 0);
+                lv_obj_set_style_bg_opa(mic_bars_[i], LV_OPA_COVER, 0);
+                lv_obj_set_style_border_width(mic_bars_[i], 0, 0);
+                lv_obj_set_style_radius(mic_bars_[i], 2, 0);
+                lv_obj_set_style_pad_all(mic_bars_[i], 0, 0);
+                lv_obj_remove_flag(mic_bars_[i], LV_OBJ_FLAG_SCROLLABLE);
             }
-            lv_obj_align(hint1, LV_ALIGN_BOTTOM_MID, 0, -32);
-
-            lv_obj_t* hint2 = lv_label_create(mic_layer_);
-            lv_label_set_text(hint2, "Hold LEFT: Back");
-            lv_obj_set_style_text_color(hint2, lv_color_hex(0x8A939B), 0);
-            if (font != nullptr) {
-                lv_obj_set_style_text_font(hint2, font, 0);
-            }
-            lv_obj_align(hint2, LV_ALIGN_BOTTOM_MID, 0, -10);
         }
+        mic_level_.store(0);
+        memset(mic_wave_hist_, 0, sizeof(mic_wave_hist_));
+        mic_wave_timer_ = lv_timer_create(MicWaveTickCb, 40, this);
         // Keep the screen on and prevent sleep while this page is open
         power_save_timer_->SetEnabled(false);
         // Auto-connect to the MicYou desktop
@@ -1020,7 +1067,11 @@ private:
             return;
         }
         mic_task_stop_ = true;
+        if (mic_streaming_) {
+            MicSignalPc("VOICE_STOP");
+        }
         mic_streaming_ = false;
+        mic_level_.store(0);
         // The mic task polls the stop flag every 20-100 ms; the discovery or
         // connect phases may need up to ~3 s to notice it.
         for (int i = 0; i < 80 && mic_task_handle_ != nullptr; i++) {
@@ -1031,404 +1082,68 @@ private:
         }
         {
             DisplayLockGuard lock(display_);
+            if (mic_wave_timer_ != nullptr) {
+                lv_timer_delete(mic_wave_timer_);
+                mic_wave_timer_ = nullptr;
+            }
             if (mic_layer_ != nullptr) {
                 lv_obj_delete(mic_layer_);
                 mic_layer_ = nullptr;
                 mic_status_label_ = nullptr;
                 mic_pc_label_ = nullptr;
+                for (int i = 0; i < 20; i++) {
+                    mic_bars_[i] = nullptr;
+                }
             }
         }
         power_save_timer_->SetEnabled(true);
         ShowBootMenu();
     }
 
-    // ---------------- Flappy Bird game ----------------
-    static void GameTickCb(lv_timer_t* timer) {
-        auto* self = static_cast<atk_dnesp32s3_box0*>(lv_timer_get_user_data(timer));
-        self->UpdateGame();
+    // ---------------- Games (implementation in box0_games.h) ----------------
+    void InitializeGames() {
+        game_platform_.random = []() { return esp_random(); };
+        game_platform_.get_font = [this]() { return GetMenuFont(); };
+        game_platform_.lock = [this]() { game_lock_ = new DisplayLockGuard(display_); };
+        game_platform_.unlock = [this]() { delete game_lock_; game_lock_ = nullptr; };
+        flappy_game_.SetPlatform(game_platform_);
+        dino_game_.SetPlatform(game_platform_);
     }
 
     void StartGame() {
-        if (game_active_ || dino_active_) {
+        if (flappy_game_.IsActive() || dino_game_.IsActive()) {
             return;
         }
-        auto disp = lv_display_get_default();
-        int w = lv_display_get_horizontal_resolution(disp);
-        int h = lv_display_get_vertical_resolution(disp);
-
-        {
-            DisplayLockGuard lock(display_);
-            game_layer_ = lv_obj_create(lv_layer_top());
-            lv_obj_set_size(game_layer_, w, h);
-            lv_obj_set_pos(game_layer_, 0, 0);
-            lv_obj_set_style_bg_color(game_layer_, lv_color_hex(0x0E1A2B), 0);
-            lv_obj_set_style_bg_opa(game_layer_, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(game_layer_, 0, 0);
-            lv_obj_set_style_radius(game_layer_, 0, 0);
-            lv_obj_set_style_pad_all(game_layer_, 0, 0);
-            lv_obj_remove_flag(game_layer_, LV_OBJ_FLAG_SCROLLABLE);
-
-            bird_ = lv_obj_create(game_layer_);
-            lv_obj_set_size(bird_, 16, 16);
-            lv_obj_set_style_radius(bird_, LV_RADIUS_CIRCLE, 0);
-            lv_obj_set_style_bg_color(bird_, lv_color_hex(0xFFD54A), 0);
-            lv_obj_set_style_bg_opa(bird_, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(bird_, 0, 0);
-
-            game_score_label_ = lv_label_create(game_layer_);
-            lv_obj_set_style_text_color(game_score_label_, lv_color_hex(0xFFFFFF), 0);
-            lv_obj_align(game_score_label_, LV_ALIGN_TOP_MID, 0, 8);
-
-            game_over_label_ = lv_label_create(game_layer_);
-            lv_obj_set_style_text_color(game_over_label_, lv_color_hex(0xFFFFFF), 0);
-            lv_obj_set_style_text_align(game_over_label_, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_align(game_over_label_, LV_ALIGN_CENTER, 0, 0);
-            lv_obj_add_flag(game_over_label_, LV_OBJ_FLAG_HIDDEN);
-
-            for (int i = 0; i < 4; i++) {
-                pipe_top_[i] = lv_obj_create(game_layer_);
-                pipe_bottom_[i] = lv_obj_create(game_layer_);
-                lv_obj_t* pair[2] = {pipe_top_[i], pipe_bottom_[i]};
-                for (int j = 0; j < 2; j++) {
-                    lv_obj_t* p = pair[j];
-                    lv_obj_set_style_bg_color(p, lv_color_hex(0x3FA34D), 0);
-                    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
-                    lv_obj_set_style_border_width(p, 0, 0);
-                    lv_obj_set_style_radius(p, 0, 0);
-                    lv_obj_set_style_pad_all(p, 0, 0);
-                    lv_obj_remove_flag(p, LV_OBJ_FLAG_SCROLLABLE);
-                    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
-                }
-            }
-        }
-
-        game_timer_ = lv_timer_create(GameTickCb, 30, this);
-        ResetGame();
-        game_active_ = true;
-    }
-
-    void ResetGame() {
-        auto disp = lv_display_get_default();
-        int h = lv_display_get_vertical_resolution(disp);
-        bird_y_ = h / 2.0f;
-        bird_vy_ = 0;
-        game_score_ = 0;
-        game_over_ = false;
-        lv_label_set_text(game_score_label_, "0");
-        lv_obj_add_flag(game_over_label_, LV_OBJ_FLAG_HIDDEN);
-        for (int i = 0; i < 4; i++) {
-            pipe_active_[i] = false;
-            pipe_scored_[i] = false;
-            lv_obj_add_flag(pipe_top_[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(pipe_bottom_[i], LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_obj_set_pos(bird_, 56, (int)bird_y_);
+        flappy_game_.Start();
+        // Keep the screen on while playing; also wakes the display if it was dimmed
+        power_save_timer_->SetEnabled(false);
     }
 
     void StopGame() {
-        if (!game_active_) {
+        if (!flappy_game_.IsActive()) {
             return;
         }
-        game_active_ = false;
-        if (game_timer_ != nullptr) {
-            lv_timer_delete(game_timer_);
-            game_timer_ = nullptr;
-        }
-        DisplayLockGuard lock(display_);
-        lv_obj_delete(game_layer_);
-        game_layer_ = nullptr;
-        bird_ = nullptr;
-    }
-
-    void Flap() {
-        if (!game_active_) {
-            return;
-        }
-        if (game_over_) {
-            DisplayLockGuard lock(display_);
-            ResetGame();
-            return;
-        }
-        bird_vy_ = -4.2f;
-    }
-
-    void UpdateGame() {
-        if (!game_active_ || game_over_) {
-            return;
-        }
-        auto disp = lv_display_get_default();
-        int w = lv_display_get_horizontal_resolution(disp);
-        int h = lv_display_get_vertical_resolution(disp);
-
-        bird_vy_ += 0.30f;
-        bird_y_ += bird_vy_;
-        lv_obj_set_pos(bird_, 56, (int)bird_y_);
-
-        for (int i = 0; i < 4; i++) {
-            if (!pipe_active_[i]) {
-                continue;
-            }
-            pipe_x_[i] -= 2.0f;
-            float gap = pipe_gap_y_[i];
-            lv_obj_set_size(pipe_top_[i], 34, (int)gap);
-            lv_obj_set_pos(pipe_top_[i], (int)pipe_x_[i], 0);
-            lv_obj_set_size(pipe_bottom_[i], 34, (int)(h - gap - 78));
-            lv_obj_set_pos(pipe_bottom_[i], (int)pipe_x_[i], (int)(gap + 78));
-
-            if (!pipe_scored_[i] && pipe_x_[i] + 34 < 56) {
-                pipe_scored_[i] = true;
-                game_score_++;
-                lv_label_set_text_fmt(game_score_label_, "%d", game_score_);
-            }
-            if (pipe_x_[i] < -40) {
-                pipe_active_[i] = false;
-                lv_obj_add_flag(pipe_top_[i], LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(pipe_bottom_[i], LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-
-        bool need_spawn = true;
-        for (int i = 0; i < 4; i++) {
-            if (pipe_active_[i] && pipe_x_[i] > w - 130) {
-                need_spawn = false;
-                break;
-            }
-        }
-        if (need_spawn) {
-            for (int i = 0; i < 4; i++) {
-                if (!pipe_active_[i]) {
-                    pipe_active_[i] = true;
-                    pipe_scored_[i] = false;
-                    pipe_x_[i] = w;
-                    pipe_gap_y_[i] = 30 + esp_random() % (uint32_t)(h - 60 - 78);
-                    lv_obj_remove_flag(pipe_top_[i], LV_OBJ_FLAG_HIDDEN);
-                    lv_obj_remove_flag(pipe_bottom_[i], LV_OBJ_FLAG_HIDDEN);
-                    break;
-                }
-            }
-        }
-
-        bool hit = (bird_y_ < 0) || (bird_y_ + 16 > h);
-        if (!hit) {
-            for (int i = 0; i < 4; i++) {
-                if (!pipe_active_[i]) {
-                    continue;
-                }
-                if (56 + 16 > pipe_x_[i] && 56 < pipe_x_[i] + 34) {
-                    if (bird_y_ < pipe_gap_y_[i] || bird_y_ + 16 > pipe_gap_y_[i] + 78) {
-                        hit = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (hit) {
-            game_over_ = true;
-            lv_label_set_text_fmt(game_over_label_, "Game Over\nScore: %d\nPress M to retry", game_score_);
-            lv_obj_remove_flag(game_over_label_, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-    // ---------------- Dino Run game ----------------
-    static void DinoTickCb(lv_timer_t* timer) {
-        auto* self = static_cast<atk_dnesp32s3_box0*>(lv_timer_get_user_data(timer));
-        self->UpdateDino();
+        flappy_game_.Stop();
+        power_save_timer_->SetEnabled(true);
     }
 
     void StartDinoGame() {
-        if (dino_active_) {
+        if (dino_game_.IsActive() || flappy_game_.IsActive()) {
             return;
         }
-        auto disp = lv_display_get_default();
-        int w = lv_display_get_horizontal_resolution(disp);
-        int h = lv_display_get_vertical_resolution(disp);
-
-        {
-            DisplayLockGuard lock(display_);
-            dino_layer_ = lv_obj_create(lv_layer_top());
-            lv_obj_set_size(dino_layer_, w, h);
-            lv_obj_set_pos(dino_layer_, 0, 0);
-            lv_obj_set_style_bg_color(dino_layer_, lv_color_hex(0xF7F7F7), 0);
-            lv_obj_set_style_bg_opa(dino_layer_, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(dino_layer_, 0, 0);
-            lv_obj_set_style_radius(dino_layer_, 0, 0);
-            lv_obj_set_style_pad_all(dino_layer_, 0, 0);
-            lv_obj_remove_flag(dino_layer_, LV_OBJ_FLAG_SCROLLABLE);
-
-            lv_obj_t* ground = lv_obj_create(dino_layer_);
-            lv_obj_set_size(ground, w, 2);
-            lv_obj_set_pos(ground, 0, h - 18);
-            lv_obj_set_style_bg_color(ground, lv_color_hex(0x9A9A9A), 0);
-            lv_obj_set_style_bg_opa(ground, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(ground, 0, 0);
-            lv_obj_set_style_radius(ground, 0, 0);
-            lv_obj_set_style_pad_all(ground, 0, 0);
-
-            dino_ = lv_obj_create(dino_layer_);
-            lv_obj_set_size(dino_, 20, 22);
-            lv_obj_set_style_radius(dino_, 4, 0);
-            lv_obj_set_style_bg_color(dino_, lv_color_hex(0x535353), 0);
-            lv_obj_set_style_bg_opa(dino_, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(dino_, 0, 0);
-
-            dino_score_label_ = lv_label_create(dino_layer_);
-            lv_obj_set_style_text_color(dino_score_label_, lv_color_hex(0x535353), 0);
-            lv_obj_align(dino_score_label_, LV_ALIGN_TOP_RIGHT, -10, 8);
-
-            dino_over_label_ = lv_label_create(dino_layer_);
-            lv_obj_set_style_text_color(dino_over_label_, lv_color_hex(0x535353), 0);
-            lv_obj_set_style_text_align(dino_over_label_, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_align(dino_over_label_, LV_ALIGN_CENTER, 0, -20);
-            lv_obj_add_flag(dino_over_label_, LV_OBJ_FLAG_HIDDEN);
-
-            for (int i = 0; i < 4; i++) {
-                cactus_[i] = lv_obj_create(dino_layer_);
-                lv_obj_set_style_bg_color(cactus_[i], lv_color_hex(0x2E7D32), 0);
-                lv_obj_set_style_bg_opa(cactus_[i], LV_OPA_COVER, 0);
-                lv_obj_set_style_border_width(cactus_[i], 0, 0);
-                lv_obj_set_style_radius(cactus_[i], 2, 0);
-                lv_obj_set_style_pad_all(cactus_[i], 0, 0);
-                lv_obj_remove_flag(cactus_[i], LV_OBJ_FLAG_SCROLLABLE);
-                lv_obj_add_flag(cactus_[i], LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-
-        dino_timer_ = lv_timer_create(DinoTickCb, 30, this);
-        ResetDino();
-        dino_active_ = true;
-    }
-
-    void ResetDino() {
-        auto disp = lv_display_get_default();
-        int h = lv_display_get_vertical_resolution(disp);
-        dino_y_ = h - 18 - 22;
-        dino_vy_ = 0;
-        dino_on_ground_ = true;
-        dino_score_ = 0;
-        dino_frame_ = 0;
-        dino_over_ = false;
-        dino_spawn_gap_ = 150;
-        lv_label_set_text(dino_score_label_, "0");
-        lv_obj_add_flag(dino_over_label_, LV_OBJ_FLAG_HIDDEN);
-        for (int i = 0; i < 4; i++) {
-            cactus_active_[i] = false;
-            lv_obj_add_flag(cactus_[i], LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_obj_set_pos(dino_, 30, (int)dino_y_);
+        dino_game_.Start();
+        // Keep the screen on while playing; also wakes the display if it was dimmed
+        power_save_timer_->SetEnabled(false);
     }
 
     void StopDinoGame() {
-        if (!dino_active_) {
+        if (!dino_game_.IsActive()) {
             return;
         }
-        dino_active_ = false;
-        if (dino_timer_ != nullptr) {
-            lv_timer_delete(dino_timer_);
-            dino_timer_ = nullptr;
-        }
-        DisplayLockGuard lock(display_);
-        lv_obj_delete(dino_layer_);
-        dino_layer_ = nullptr;
-        dino_ = nullptr;
+        dino_game_.Stop();
+        power_save_timer_->SetEnabled(true);
     }
 
-    void DinoJump() {
-        if (!dino_active_) {
-            return;
-        }
-        if (dino_over_) {
-            DisplayLockGuard lock(display_);
-            ResetDino();
-            return;
-        }
-        if (dino_on_ground_) {
-            dino_vy_ = -5.4f;
-            dino_on_ground_ = false;
-        }
-    }
-
-    void UpdateDino() {
-        if (!dino_active_ || dino_over_) {
-            return;
-        }
-        auto disp = lv_display_get_default();
-        int w = lv_display_get_horizontal_resolution(disp);
-        int h = lv_display_get_vertical_resolution(disp);
-        float ground_top = h - 18;
-
-        // Jump physics
-        if (!dino_on_ground_) {
-            dino_vy_ += 0.35f;
-            dino_y_ += dino_vy_;
-            float rest = ground_top - 22;
-            if (dino_y_ >= rest) {
-                dino_y_ = rest;
-                dino_vy_ = 0;
-                dino_on_ground_ = true;
-            }
-            lv_obj_set_pos(dino_, 30, (int)dino_y_);
-        }
-
-        // Move cacti
-        for (int i = 0; i < 4; i++) {
-            if (!cactus_active_[i]) {
-                continue;
-            }
-            cactus_x_[i] -= 2.5f;
-            lv_obj_set_size(cactus_[i], 14, cactus_h_[i]);
-            lv_obj_set_pos(cactus_[i], (int)cactus_x_[i], (int)(ground_top - cactus_h_[i]));
-            if (cactus_x_[i] < -20) {
-                cactus_active_[i] = false;
-                lv_obj_add_flag(cactus_[i], LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-
-        // Spawn cactus
-        bool need_spawn = true;
-        for (int i = 0; i < 4; i++) {
-            if (cactus_active_[i] && cactus_x_[i] > w - dino_spawn_gap_) {
-                need_spawn = false;
-                break;
-            }
-        }
-        if (need_spawn) {
-            for (int i = 0; i < 4; i++) {
-                if (!cactus_active_[i]) {
-                    cactus_active_[i] = true;
-                    cactus_x_[i] = w;
-                    cactus_h_[i] = 18 + esp_random() % 18;
-                    dino_spawn_gap_ = 130 + esp_random() % 90;
-                    lv_obj_remove_flag(cactus_[i], LV_OBJ_FLAG_HIDDEN);
-                    break;
-                }
-            }
-        }
-
-        // Score by survival time
-        dino_frame_++;
-        if (dino_frame_ % 8 == 0) {
-            dino_score_++;
-            lv_label_set_text_fmt(dino_score_label_, "%d", dino_score_);
-        }
-
-        // Collision
-        bool hit = false;
-        for (int i = 0; i < 4; i++) {
-            if (!cactus_active_[i]) {
-                continue;
-            }
-            if (30 + 20 > cactus_x_[i] && 30 < cactus_x_[i] + 14) {
-                if (dino_y_ + 22 > ground_top - cactus_h_[i]) {
-                    hit = true;
-                    break;
-                }
-            }
-        }
-        if (hit) {
-            dino_over_ = true;
-            lv_label_set_text_fmt(dino_over_label_, "Game Over\nScore: %d\nPress M to retry", dino_score_);
-            lv_obj_remove_flag(dino_over_label_, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
     void InitializeButtons() {
         middle_button_.OnClick([this]() {
         // First press just wakes the dimmed screen
@@ -1437,12 +1152,12 @@ private:
             power_sleep_ = kDeviceNoSleep;
             return;
         }
-        if (game_active_) {
-            Flap();
+        if (flappy_game_.IsActive()) {
+            flappy_game_.Flap();
             return;
         }
-        if (dino_active_) {
-            DinoJump();
+        if (dino_game_.IsActive()) {
+            dino_game_.Jump();
             return;
         }
         if (mic_layer_ != nullptr) {
@@ -1466,7 +1181,7 @@ private:
             }
             return;
         }
-        if (game_active_ || dino_active_) {
+        if (flappy_game_.IsActive() || dino_game_.IsActive()) {
             return;
         }
         if (about_layer_ != nullptr) {
@@ -1541,7 +1256,7 @@ private:
             power_sleep_ = kDeviceNoSleep;
             return;
         }
-        if (game_active_ || dino_active_) {
+        if (flappy_game_.IsActive() || dino_game_.IsActive()) {
             return;
         }
         if (about_layer_ != nullptr) {
@@ -1574,12 +1289,12 @@ private:
                 ExitMicPage();
                 return;
             }
-            if (game_active_) {
+            if (flappy_game_.IsActive()) {
                 StopGame();
                 ShowBootMenu();
                 return;
             }
-            if (dino_active_) {
+            if (dino_game_.IsActive()) {
                 StopDinoGame();
                 ShowBootMenu();
                 return;
@@ -1601,7 +1316,7 @@ private:
             power_sleep_ = kDeviceNoSleep;
             return;
         }
-        if (game_active_ || dino_active_) {
+        if (flappy_game_.IsActive() || dino_game_.IsActive()) {
             return;
         }
         if (about_layer_ != nullptr) {
@@ -1609,6 +1324,8 @@ private:
             return;
         }
         if (mic_layer_ != nullptr) {
+            // Confirm/send the recognized text: voice_link turns this into Enter
+            MicSignalPc("VOICE_ENTER");
             return;
         }
         if (menu_visible_) {
@@ -1671,6 +1388,7 @@ public:
         right_button_(R_BUTTON_GPIO, false),
         left_button_(L_BUTTON_GPIO, false),
         middle_button_(M_BUTTON_GPIO, true) {
+        EnsureDefaultWifi();
         InitializeBoardPowerManager();
         InitializePowerManager();
         InitializePowerSaveTimer();
@@ -1678,6 +1396,7 @@ public:
         InitializeSpi();
         InitializeSt7789Display();
         InitializeButtons();
+        InitializeGames();
         GetBacklight()->RestoreBrightness();
         // Show the boot menu after the device reaches idle state (display theme/fonts are ready by then)
         esp_timer_create_args_t menu_timer_args = {
