@@ -1,4 +1,18 @@
-﻿# Project Memory
+# Project Memory
+
+## 2026-09-07 双机环境 + WiFi 双网络配置
+- **此仓库在两台 Windows PC 间共享（本文档两边都会读到，记录时不要写"本机是 XX"）**：A 机 = N150 小主机，用户目录是中文（C:\Users\孙永飞），CPU 弱，**禁止全量编译**；B 机 = Ultra7，用户目录是英文，无中文路径问题，适合全量编译。新会话先判断自己在哪台机器（看 CPU 型号或用户目录路径即可区分）。ESP-IDF 6 工具链多处不兼容非 ASCII 路径（只有 A 机会踩），踩过的点逐个是：
+  1. export.bat/export.ps1 的激活脚本（activate.py 用 UTF-8 无 BOM 写临时 bat/ps1，cmd/PowerShell 5.1 按 GBK 解码）→ 环境变量里的中文路径变乱码路径 → venv 失效、python 回退系统 Python 3.14、build.py 探测 IDF 失败
+  2. cmake（.espressif 的 4.0.3）对非 ASCII 的 **构建目录** 直接崩溃（0xC0000409）；源码目录中文没问题
+  3. kconfgen 等 IDF python 工具按 locale（GBK）读文件 → PYTHONUTF8=1 解决
+  4. ccache 4.12.1 用 std::filesystem，遇非 ASCII 路径直接 abort；objdump 处理中文路径的 .a 也失败
+  5. idf.py 对 project_dir 调 os.path.realpath()，junction 和 subst 盘符都会被解析回真实中文路径，骗不过
+- 最终方案（两边机器通用）：项目正本留在各自的 Documents\Workspace\xiaozhi-esp32（A 机；B 机可在任意位置），只把 SDK+工具链放 ASCII 路径：C:\Workspace\esp-idf-v6.0.2（A 机已从 Documents\Opts 拷贝，排除 .git）+ C:\Workspace\.espressif（IDF_TOOLS_PATH，install.bat esp32s3 重装）+ C:\Workspace\Temp。
+- 一键编译刷机：powershell -ExecutionPolicy Bypass -File <repo>\box0_build_flash.ps1。脚本自动探测：repo=脚本所在目录；ESP-IDF 依次试 ESP_IDF_DIR 环境变量→C:\Workspace\esp-idf-v6.0.2→%USERPROFILE%\Documents\Opts→D:\Opts；串口 BOX0_PORT 环境变量→只有一个串口时自动用它→否则 COM3。**repo 路径含非 ASCII 时自动 robocopy 镜像到 C:\Workspace\box0-repo-mirror 再编译**（镜像是构建缓存，别手动改），英文路径机器（B 机）上原地构建零开销。flash_box0.bat 是旧 cmd 入口，优先用 ps1。
+- box0_setup.ps1（A 机的 C:\Workspace）：一次性把 SDK 拷到 C:\Workspace 并重装工具链，可重复执行（robocopy 增量）。注意 robocopy 会被 Git Bash 参数转换坑（/E 变路径），要 export MSYS2_ARG_CONV_EXCL='*' 或直接 PowerShell 跑；IDF 里 npl_sycfg.h 文件名非法需 /XF 跳过。
+- WiFi 配置升级：box0_config.ini 支持 [wifi]/[wifi2]/[wifi3]... 多网络（scripts/box0_gen_config.py 生成 BOX0_WIFI2_SSID 等宏）；EnsureDefaultWifi 改为"缺哪个补哪个"（按 SSID 查重，NVS 已有网络优先），不再只在空列表时加默认。
+- 当前配置：iKuai-1024 + Ziroom901_1（自如 2.4G，5G 后缀的 _5G 网络 ESP32-S3 用不了，SSID 大小写敏感，正确拼写是 Ziroom901_1）。已实测连上 Ziroom901_1 且 MQTT 激活成功。
+- MicYou 插件（box0-voice-link）在 A 机用 VS2022 BuildTools 的 MSVC 编译：powershell -ExecutionPolicy Bypass -File pc-tools/box0-voice-link/build_msvc.ps1（手工设 INCLUDE/LIB/PATH，不走 vcvars——cmd 对带空格引号路径处理在这台机器上不可靠）。源码需 #include <stdlib.h>（MSVC 严格）。安装用 micyou-cli plugin enable dev.box0.voicelink（会生成 plugin-state.json），重启 MicYou 后验证 UDP 9125 被 micyou.exe 占用。
 
 ## 2026-09-06：正点原子 ESP32 AI BOX0 资料包
 

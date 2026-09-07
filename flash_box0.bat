@@ -15,7 +15,9 @@ rem ============================================================
 setlocal
 set "MSYSTEM="
 set "MSYS2_PATH_TYPE="
-if "%ESP_IDF_DIR%"=="" set ESP_IDF_DIR=D:\Opts\esp-idf-v6.0.2
+if "%ESP_IDF_DIR%"=="" (
+    if exist "C:\Workspace\esp-idf-v6.0.2\export.bat" (set ESP_IDF_DIR=C:\Workspace\esp-idf-v6.0.2) else (set ESP_IDF_DIR=D:\Opts\esp-idf-v6.0.2)
+)
 if "%BOX0_PORT%"=="" set BOX0_PORT=COM3
 cd /d %~dp0
 

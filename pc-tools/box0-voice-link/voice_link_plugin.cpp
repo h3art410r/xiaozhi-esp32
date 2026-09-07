@@ -1,4 +1,4 @@
-﻿// Box0 Voice Link - MicYou native plugin.
+// Box0 Voice Link - MicYou native plugin.
 // Listens on UDP 9125 for BOX0 wireless-mic button signals and translates
 // them into desktop hotkeys (WeChat Input voice typing):
 //   VOICE_START -> Ctrl+Win+Shift (start voice input)
@@ -14,6 +14,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const mpl_plugin_info_t g_info = { MPL_ABI_VERSION, 1u, "dev.box0.voicelink", "1.0.0" };

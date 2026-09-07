@@ -35,6 +35,7 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <atomic>
+#include <algorithm>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -195,13 +196,26 @@ private:
 
     // Personal default WiFi credentials (from box0_local_config.h, generated
     // from box0_config.ini by flash_box0.bat) so the board connects without
-    // the manual provisioning flow.
+    // the manual provisioning flow. Each default is added only if its SSID is
+    // not saved yet; existing entries keep their order (NVS stays first).
     void EnsureDefaultWifi() {
         auto& ssid_manager = SsidManager::GetInstance();
-        if (ssid_manager.GetSsidList().empty()) {
-            ssid_manager.AddSsid(BOX0_WIFI_SSID, BOX0_WIFI_PASSWORD);
-            ESP_LOGI(TAG, "No saved WiFi credentials, using defaults from box0_config.ini");
-        }
+        auto ensure = [&ssid_manager](const char* ssid, const char* password) {
+            const auto& list = ssid_manager.GetSsidList();
+            bool exists = std::any_of(list.begin(), list.end(),
+                [&](const SsidItem& item) { return item.ssid == ssid; });
+            if (!exists) {
+                ssid_manager.AddSsid(ssid, password);
+                ESP_LOGI(TAG, "Added default WiFi %s from box0_config.ini", ssid);
+            }
+        };
+        ensure(BOX0_WIFI_SSID, BOX0_WIFI_PASSWORD);
+#if defined(BOX0_WIFI2_SSID)
+        ensure(BOX0_WIFI2_SSID, BOX0_WIFI2_PASSWORD);
+#endif
+#if defined(BOX0_WIFI3_SSID)
+        ensure(BOX0_WIFI3_SSID, BOX0_WIFI3_PASSWORD);
+#endif
     }
 
     void InitializePowerSaveTimer() {
