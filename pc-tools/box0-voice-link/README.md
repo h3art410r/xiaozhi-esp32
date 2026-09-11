@@ -6,11 +6,11 @@
 
 ```
 BOX0（无线麦页面）
-  M 键开始/停止推流、右键
-    -> UDP 9125 发送 VOICE_START / VOICE_STOP / VOICE_ENTER
+  M 短按开始/停止、M 长按按住说话、右键发送、左键删除
+    -> UDP 9125 发送 VOICE_START / VOICE_STOP / VOICE_HOLD_START / VOICE_HOLD_STOP / VOICE_ENTER / VOICE_DELETE
 MicYou 插件（本目录编译出的 box0_voice_link.dll）
-    -> SendInput 模拟 Ctrl+Win+Shift / ESC / Enter
-微信输入法语音输入
+    -> SendInput 点按 Ctrl+Win+Shift / 按住·松开 左Alt+左Win / Enter / Backspace
+微信输入法语音输入（点按模式：Ctrl+Win+Shift；按住说话：左Alt+左Win）
 ```
 
 固件侧发信号代码：`main/boards/alientek/atk-dnesp32s3-box0/atk_dnesp32s3_box0.cc` 的 `MicSignalPc()`（目标 IP 来自 mDNS 发现 MicYou 的结果，固件端常量 `kMicVoicePort = 9125`）。
@@ -40,9 +40,11 @@ MicYou 插件卡片上的表单直接改（或编辑 `%APPDATA%/micyou/plugin-st
 
 | key | 默认 | 说明 |
 |---|---|---|
-| startKeys | CTRL+WIN+SHIFT | 开始语音输入组合键（+ 连接，支持 CTRL/ALT/SHIFT/WIN/A-Z/0-9/F1-F12/ESC/SPACE/ENTER/TAB） |
-| stopKeys | ESC | 结束语音输入 |
+| startKeys | CTRL+WIN+SHIFT | M 短按开始语音输入（支持 CTRL/ALT/SHIFT/WIN/RALT/RCTRL/A-Z/0-9/F1-F12/ESC/SPACE/ENTER/TAB/BACKSPACE/DELETE，+ 连接） |
+| stopKeys | CTRL+WIN+SHIFT | M 短按结束语音输入（再按任意键即退出，重发同一组合键即可） |
+| holdKeys | ALT+WIN | M 长按期间保持按住的组合键（按住说话，松手释放） |
 | enterKeys | ENTER | 发送识别文本 |
+| deleteKeys | BACKSPACE | 向左删除一个字符 |
 | port | 9125 | UDP 监听端口 |
 
 改配置后需重启 MicYou（插件 init 时读一次）。
@@ -50,5 +52,5 @@ MicYou 插件卡片上的表单直接改（或编辑 `%APPDATA%/micyou/plugin-st
 ## 注意
 
 - `plugin.json` 必须是无 BOM 的 UTF-8，否则 manifest 解析失败
-- 快捷键生效要求微信输入法是当前活动输入法
+- 快捷键生效要求微信输入法是当前活动输入法；微信语音输入的热键需保持默认（点按=Ctrl+Win+Shift，按住说话=左Alt+左Win）
 - 参考文档：MicYou 仓库 docs/plugins/development-guide.md（本目录的 micyou_plugin_abi.h 即拷自该仓库 tauri-app/crates/micyou-plugin/include/）

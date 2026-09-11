@@ -1,9 +1,12 @@
 // Box0 Voice Link - MicYou native plugin.
 // Listens on UDP 9125 for BOX0 wireless-mic button signals and translates
 // them into desktop hotkeys (WeChat Input voice typing):
-//   VOICE_START -> Ctrl+Win+Shift (start voice input)
-//   VOICE_STOP  -> ESC (end voice input)
-//   VOICE_ENTER -> Enter (send recognized text)
+//   VOICE_START      -> tap Ctrl+Win+Shift (start voice input)
+//   VOICE_STOP       -> tap Ctrl+Win+Shift again (any key exits)
+//   VOICE_HOLD_START -> hold Left Alt+Left Win down (hold-to-talk while M is held)
+//   VOICE_HOLD_STOP  -> release Left Alt+Left Win
+//   VOICE_ENTER      -> Enter (send recognized text)
+//   VOICE_DELETE     -> Backspace (delete left)
 // Hotkeys and port are editable on the plugin card in MicYou (config.read).
 
 #include "micyou_plugin_abi.h"
@@ -43,10 +46,14 @@ static WORD key_vk(const char* name, size_t len) {
     if (!strcmp(buf, "WIN")) return VK_LWIN;
     if (!strcmp(buf, "ALT")) return VK_LMENU;
     if (!strcmp(buf, "SHIFT")) return VK_LSHIFT;
+    if (!strcmp(buf, "RALT")) return VK_RMENU;
+    if (!strcmp(buf, "RCTRL") || !strcmp(buf, "RCONTROL")) return VK_RCONTROL;
     if (!strcmp(buf, "ESC")) return VK_ESCAPE;
     if (!strcmp(buf, "SPACE")) return VK_SPACE;
     if (!strcmp(buf, "ENTER")) return VK_RETURN;
     if (!strcmp(buf, "TAB")) return VK_TAB;
+    if (!strcmp(buf, "BACKSPACE")) return VK_BACK;
+    if (!strcmp(buf, "DELETE")) return VK_DELETE;
     if (len == 1 && buf[0] >= 'A' && buf[0] <= 'Z') return (WORD)buf[0];
     if (len == 1 && buf[0] >= '0' && buf[0] <= '9') return (WORD)buf[0];
     if (len >= 2 && buf[0] == 'F') {
@@ -89,15 +96,21 @@ static void press_combo(const WORD* keys, int count, int hold_ms) {
 
 // ---- config ----
 static char g_start_keys[64] = "CTRL+WIN+SHIFT";
-static char g_stop_keys[64] = "ESC";
+static char g_stop_keys[64] = "CTRL+WIN+SHIFT";
+static char g_hold_keys[64] = "ALT+WIN";
 static char g_enter_keys[64] = "ENTER";
+static char g_delete_keys[64] = "BACKSPACE";
 static int g_port = 9125;
 static WORD g_start_combo[6];
 static int g_start_n = 0;
 static WORD g_stop_combo[6];
 static int g_stop_n = 0;
+static WORD g_hold_combo[6];
+static int g_hold_n = 0;
 static WORD g_enter_combo[6];
 static int g_enter_n = 0;
+static WORD g_delete_combo[6];
+static int g_delete_n = 0;
 
 // Config values arrive as JSON (strings are quoted); strip one pair of quotes.
 static void read_cfg_str(const char* key, char* out, size_t outsz) {
@@ -150,9 +163,10 @@ static DWORD WINAPI udp_thread(LPVOID arg) {
     DWORD tv = 200;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
     {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "[voice-link] listening UDP %d (start=%s stop=%s enter=%s)",
-                 g_port, g_start_keys, g_stop_keys, g_enter_keys);
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "[voice-link] listening UDP %d (start=%s stop=%s hold=%s enter=%s delete=%s)",
+                 g_port, g_start_keys, g_stop_keys, g_hold_keys, g_enter_keys, g_delete_keys);
         plog(MPL_LOG_INFO, msg);
     }
     while (!g_stop) {
@@ -166,9 +180,18 @@ static DWORD WINAPI udp_thread(LPVOID arg) {
         } else if (!strncmp(buf, "VOICE_STOP", 10)) {
             plog(MPL_LOG_INFO, "[voice-link] VOICE_STOP");
             press_combo(g_stop_combo, g_stop_n, 0);
+        } else if (!strncmp(buf, "VOICE_HOLD_START", 16)) {
+            plog(MPL_LOG_INFO, "[voice-link] VOICE_HOLD_START");
+            for (int i = 0; i < g_hold_n; i++) send_key(g_hold_combo[i], 0);
+        } else if (!strncmp(buf, "VOICE_HOLD_STOP", 15)) {
+            plog(MPL_LOG_INFO, "[voice-link] VOICE_HOLD_STOP");
+            for (int i = g_hold_n - 1; i >= 0; i--) send_key(g_hold_combo[i], 1);
         } else if (!strncmp(buf, "VOICE_ENTER", 11)) {
             plog(MPL_LOG_INFO, "[voice-link] VOICE_ENTER");
             press_combo(g_enter_combo, g_enter_n, 0);
+        } else if (!strncmp(buf, "VOICE_DELETE", 12)) {
+            plog(MPL_LOG_INFO, "[voice-link] VOICE_DELETE");
+            press_combo(g_delete_combo, g_delete_n, 0);
         }
     }
     closesocket(s);
@@ -184,7 +207,9 @@ extern "C" MPL_EXPORT mpl_result_t micyou_plugin_init(const mpl_host_api_t* host
 
     read_cfg_str("startKeys", g_start_keys, sizeof(g_start_keys));
     read_cfg_str("stopKeys", g_stop_keys, sizeof(g_stop_keys));
+    read_cfg_str("holdKeys", g_hold_keys, sizeof(g_hold_keys));
     read_cfg_str("enterKeys", g_enter_keys, sizeof(g_enter_keys));
+    read_cfg_str("deleteKeys", g_delete_keys, sizeof(g_delete_keys));
     {
         char tmp[32] = {0};
         read_cfg_str("port", tmp, sizeof(tmp));
@@ -196,8 +221,10 @@ extern "C" MPL_EXPORT mpl_result_t micyou_plugin_init(const mpl_host_api_t* host
 
     g_start_n = parse_combo(g_start_keys, g_start_combo, 6);
     g_stop_n = parse_combo(g_stop_keys, g_stop_combo, 6);
+    g_hold_n = parse_combo(g_hold_keys, g_hold_combo, 6);
     g_enter_n = parse_combo(g_enter_keys, g_enter_combo, 6);
-    if (g_start_n == 0 || g_stop_n == 0 || g_enter_n == 0) {
+    g_delete_n = parse_combo(g_delete_keys, g_delete_combo, 6);
+    if (g_start_n == 0 || g_stop_n == 0 || g_hold_n == 0 || g_enter_n == 0 || g_delete_n == 0) {
         plog(MPL_LOG_ERROR, "[voice-link] invalid key combo in config");
         return MPL_ERR_INVALID_ARG;
     }

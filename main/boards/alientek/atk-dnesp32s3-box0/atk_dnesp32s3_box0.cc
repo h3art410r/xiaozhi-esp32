@@ -87,6 +87,9 @@ private:
     TaskHandle_t mic_task_handle_ = nullptr;
     std::atomic<bool> mic_task_stop_{false};
     std::atomic<bool> mic_streaming_{false};
+    bool mic_hold_ = false;
+    bool mic_hold_consumed_ = false;
+    esp_timer_handle_t mic_hold_timer_ = nullptr;
     bool mic_engine_muted_ = false;
     bool mdns_started_ = false;
     int64_t mic_session_id_ = 0;
@@ -942,8 +945,60 @@ private:
         MicSignalPc(mic_streaming_ ? "VOICE_START" : "VOICE_STOP");
     }
 
+    // Hold-to-talk (Doubao long-press mode): M held -> Right Alt held down,
+    // M released -> Right Alt released. Streaming runs for the hold duration.
+    static void MicHoldTimerCb(void* arg) {
+        static_cast<atk_dnesp32s3_box0*>(arg)->MicHoldStart();
+    }
+
+    // Enter hold-to-talk after a short grace period from press-down, not after
+    // the button driver's long-press threshold (~1.5 s), so recording starts
+    // almost immediately when M is held.
+    void ArmMicHoldTimer() {
+        if (mic_hold_timer_ == nullptr) {
+            esp_timer_create_args_t args = {};
+            args.callback = &MicHoldTimerCb;
+            args.arg = this;
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "mic_hold";
+            if (esp_timer_create(&args, &mic_hold_timer_) != ESP_OK) {
+                return;
+            }
+        }
+        esp_timer_stop(mic_hold_timer_);
+        esp_timer_start_once(mic_hold_timer_, 350 * 1000);
+    }
+
+    void MicHoldStart() {
+        if (mic_hold_) {
+            return;
+        }
+        mic_hold_ = true;
+        if (mic_task_handle_ == nullptr) {
+            mic_task_stop_ = false;
+            mic_streaming_ = false;
+            mic_rx_len_ = 0;
+            xTaskCreate(MicTaskEntry, "box0_mic", 8192, this, 5, &mic_task_handle_);
+        }
+        mic_streaming_ = true;
+        MicSetStatus("Streaming...", true);
+        MicSignalPc("VOICE_HOLD_START");
+    }
+
+    void MicHoldStop() {
+        if (!mic_hold_) {
+            return;
+        }
+        mic_hold_ = false;
+        mic_hold_consumed_ = true;  // suppress the click event on release
+        mic_streaming_ = false;
+        MicSetStatus("Connected");
+        MicSignalPc("VOICE_HOLD_STOP");
+    }
+
     // Notify the PC-side voice_link helper over UDP so it can press the
-    // voice-input hotkey (start) / ESC (stop) / Enter (send) on the desktop.
+    // voice-input hotkey (start/stop) / Enter (send) / Backspace (delete) on
+    // the desktop.
     void MicSignalPc(const char* msg) {
         if (mic_pc_ip_.addr == 0) {
             return;
@@ -1081,7 +1136,13 @@ private:
             return;
         }
         mic_task_stop_ = true;
-        if (mic_streaming_) {
+        if (mic_hold_timer_ != nullptr) {
+            esp_timer_stop(mic_hold_timer_);
+        }
+        if (mic_hold_) {
+            mic_hold_ = false;
+            MicSignalPc("VOICE_HOLD_STOP");
+        } else if (mic_streaming_) {
             MicSignalPc("VOICE_STOP");
         }
         mic_streaming_ = false;
@@ -1175,6 +1236,10 @@ private:
             return;
         }
         if (mic_layer_ != nullptr) {
+            if (mic_hold_consumed_) {
+                mic_hold_consumed_ = false;
+                return;
+            }
             ToggleMicStreaming();
             return;
         }
@@ -1213,7 +1278,20 @@ private:
             }
         });
 
+        middle_button_.OnPressDown([this]() {
+            if (mic_layer_ != nullptr) {
+                ArmMicHoldTimer();
+            }
+        });
+
         middle_button_.OnPressUp([this]() {
+            if (mic_hold_timer_ != nullptr) {
+                esp_timer_stop(mic_hold_timer_);
+            }
+            if (mic_hold_) {
+                MicHoldStop();
+                return;
+            }
             if (LcdStatus_ == kDevicelcdbacklightOff) {
                 Application::GetInstance().StopListening();
                 Application::GetInstance().SetDeviceState(kDeviceStateIdle);
@@ -1234,6 +1312,7 @@ private:
 
         middle_button_.OnLongPress([this]() {
             if (mic_layer_ != nullptr) {
+                MicHoldStart();
                 return;
             }
             auto& app = Application::GetInstance();
@@ -1278,6 +1357,8 @@ private:
             return;
         }
         if (mic_layer_ != nullptr) {
+            // Delete a misrecognized character: voice_link turns this into Backspace
+            MicSignalPc("VOICE_DELETE");
             return;
         }
         if (menu_visible_) {
