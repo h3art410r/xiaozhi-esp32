@@ -1,5 +1,25 @@
 # Project Memory
 
+## 2026-09-14 无线麦改版：持续录音 + M 切换快捷键 + 右键发送（插件 v1.2.0）
+- 新交互（用户定稿，9-14 三次调整）：进无线麦页面=自动发现/连接/开始持续推流+录音；**左/右键循环切换桌面快捷键（屏幕显示 KEY: VOICE/ENTER/DEL），M 短按发送选中的快捷键；M 长按（约0.8s）暂停/恢复录音**（发 REC_STOP/REC_START，插件端=新录音会话）；左键长按退出页面（不变）。M 长按的"按住说话"（VOICE_HOLD）已随之取消
+- **VOICE 两段式自动切 Enter**（用户动线：按 VOICE 说话 → 再按 VOICE 收字进对话框 → 按 Enter 发送）：固件 mic_voice_active_ 状态机——第一次发 KEY_SEND 0 后保持 VOICE（等第二次按停止），第二次发完自动切到 ENTER；发其它键或左右键手动切换会重置该状态
+- 固件 atk_dnesp32s3_box0.cc：MicTaskRun 拆成 MicConnectSession（mDNS+握手，单次）+ MicStreamLoop，外层 while 自动重连；连接成功即发 REC_START、断开/退出发 REC_STOP；屏幕新增 mic_rec_label_（REC mm:ss 红/灰）+ mic_key_label_；波形区上移（center h-36，max 28）
+- 插件 v1.2.0：REC_START/STOP 控制录音会话；麦克轨 = micyou_plugin_process 实时回调拷贝进 2MB SPSC 环形缓冲（**bypass=1 不改音频**，g_mic_channels 首帧定声道数、采样率用 host audio_state JSON 的 sampleRate 查、失败默认 16000）；系统声音轨 = WASAPI loopback（默认输出设备，**Initialize 后必须 ac->Start() 否则一个包都收不到**；AUDCLNT_BUFFERFLAGS_SILENT 要写零不能跳过，否则文件长度不对）；writer 线程看门狗 3s 无麦克帧自动停录；停止时流式线性重采样混出 _mix.wav（out_rate=max 两轨、out_ch=max、增益 micGain/sysGain）
+- 录音文件：%USERPROFILE%\Documents\box0-rec\rec_<时间>_{mic,sys,mix}.wav（16-bit PCM，头先占位停止时回填）；recDir/micGain/sysGain 可配置
+- UDP 协议新增：REC_START / REC_STOP / "KEY_SEND n"（0=startKeys 1=enterKeys 2=deleteKeys）；VOICE_START/STOP/ENTER 固件不再发但插件兼容保留
+- 本机已实测：无麦时发 REC_START/STOP，sys 轨 4.6s 抓到蜂鸣（peak 16382），mix 正确回退单轨；插件已部署
+- **本机 ESP-IDF 编译坑**：Git Bash 每个子 shell 都会被 /etc/profile 重设 MSYSTEM（unset 无效、env -u 也无效），export.sh 的 idf_tools.py 检测到就拒跑。正路 = PowerShell：`Remove-Item Env:MSYSTEM; . D:\Opts\esp-idf-v6.0.2\export.ps1; python scripts/build.py ...`（export.ps1 不查 MSYSTEM）
+- 固件编译验证中，刷机用 box0_build_flash.ps1；用户实机验证项：M 切键/右键发送/录音文件三件套
+
+## 2026-09-08 豆包输入法适配（已按用户要求撤销）
+- 曾给 box0-voice-link 插件 v1.1.0 加过"自动检测当前输入法（微信/豆包）切换组合键"（preset: auto/wechat/doubao/custom，TSF EnumProfiles 筛 TF_IPP_FLAG_ACTIVE + 注册表 Description 分类），用户实测豆包语音条弹窗后录不了音（PC 手动按热键也一样），判定为**豆包输入法自身问题**，要求撤销、不做兼容
+- 已整体回滚：pc-tools/box0-voice-link 恢复 v1.0.0（微信专用：点按 Ctrl+Win+Shift / 按住 左Alt+左Win），本机插件和 plugin-state.json（preset 已删）已同步还原
+- 若将来重启此方向，以下实测结论有用：
+  - 微信输入法注册名是 **"WeType"**（CLSID 86598FB9-66A2-463E-B9C2-AEB906D477AD）
+  - **豆包输入法** CLSID **9D2B2E2B-3C93-4D2F-9D35-6EEB85F0D2B0**，InprocServer32=C:\Windows\System32\tsf-oime.dll，描述"豆包输入法"，2026-09-12 由 oime-installer 正常注册在系统输入法列表（第一顺位），Win+Space 可切到。注意控制台 GBK 乱码曾被误读成"搜狗"
+  - TSF 检测坑：GetActiveProfile 在 Win11 返回 E_INVALIDARG 不可用；GetLanguageProfileDescription 对微信/豆包返回空串不可用；可用路径是 EnumProfiles(langid) 筛 TF_IPP_FLAG_ACTIVE(老头文件需自定义 0x1) + 读 HKLM CTF\TIP\{clsid}\LanguageProfile\0x%08x{langid}\{profile-guid} 的 Description（64/32 注册表视图都要试）；MinGW msctf.h 缺 CLSID/常量定义需自补
+  - 本机默认录音设备是 CABLE Output（VB-Cable，MicYou 链路故意为之）；共享模式随时可打开（实测），独占模式 VB-Cable 不支持（E_UNSUPPORTED_FORMAT）；豆包 config 里 voice/selectedMicrophoneId=ime_auto_detect_microphone_id、长按语音快捷键 mode=None（默认关）
+
 ## 2026-09-07 双机环境 + WiFi 双网络配置
 - **此仓库在两台 Windows PC 间共享（本文档两边都会读到，记录时不要写"本机是 XX"）**：A 机 = N150 小主机，用户目录是中文（C:\Users\孙永飞），CPU 弱，**禁止全量编译**；B 机 = Ultra7，用户目录是英文，无中文路径问题，适合全量编译。新会话先判断自己在哪台机器（看 CPU 型号或用户目录路径即可区分）。ESP-IDF 6 工具链多处不兼容非 ASCII 路径（只有 A 机会踩），踩过的点逐个是：
   1. export.bat/export.ps1 的激活脚本（activate.py 用 UTF-8 无 BOM 写临时 bat/ps1，cmd/PowerShell 5.1 按 GBK 解码）→ 环境变量里的中文路径变乱码路径 → venv 失效、python 回退系统 Python 3.14、build.py 探测 IDF 失败

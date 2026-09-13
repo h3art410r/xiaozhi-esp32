@@ -5,12 +5,12 @@
     "zh-CN": "Box0 语音联动",
     "en": "Box0 Voice Link"
   },
-  "description": "Bridges BOX0 wireless-mic buttons to desktop hotkeys: M tap toggles WeChat voice input (Ctrl+Win+Shift), M hold = hold-to-talk (Left Alt+Left Win), RIGHT sends Enter, LEFT sends Backspace.",
+  "description": "BOX0 wireless mic bridge. The mic page streams continuously and records automatically: each session writes rec_<time>_{mic,sys,mix}.wav (mic track from the live audio stream, system track via WASAPI loopback, plus a mixed file). M cycles the on-screen hotkey (KEY_SEND 0/1/2 = start/enter/delete), RIGHT sends it, M hold = hold-to-talk (Left Alt+Left Win), LEFT sends Backspace.",
   "descriptionI18n": {
-    "zh-CN": "将 BOX0 无线麦按键映射为桌面快捷键：M 短按开始/停止微信语音输入（Ctrl+Win+Shift），M 长按按住说话（左Alt+左Win），右键发送 Enter，左键发送 Backspace。",
-    "en": "Bridges BOX0 wireless-mic buttons to desktop hotkeys: M tap toggles WeChat voice input (Ctrl+Win+Shift), M hold = hold-to-talk (Left Alt+Left Win), RIGHT sends Enter, LEFT sends Backspace."
+    "zh-CN": "BOX0 无线麦联动。无线麦页面持续推流并自动录音：每次会话写出 rec_<时间>_{mic,sys,mix}.wav（麦克轨来自实时音频流、系统声音轨来自 WASAPI loopback、另有混合文件）。M 循环切换屏幕上的快捷键（KEY_SEND 0/1/2 = 语音开关/Enter/Backspace），右键发送，M 长按按住说话（左Alt+左Win），左键发送 Backspace。",
+    "en": "BOX0 wireless mic bridge. The mic page streams continuously and records automatically: each session writes rec_<time>_{mic,sys,mix}.wav (mic track from the live audio stream, system track via WASAPI loopback, plus a mixed file). M cycles the on-screen hotkey (KEY_SEND 0/1/2 = start/enter/delete), RIGHT sends it, M hold = hold-to-talk (Left Alt+Left Win), LEFT sends Backspace."
   },
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "box0",
   "license": "GPL-3.0-only",
   "runtime": "native",
@@ -25,15 +25,20 @@
     "holdKeys": "ALT+WIN",
     "enterKeys": "ENTER",
     "deleteKeys": "BACKSPACE",
+    "recDir": "",
+    "micGain": 1.0,
+    "sysGain": 1.0,
     "port": 9125
   },
   "configSchema": {
     "fields": [
-      { "key": "startKeys", "fieldType": "string", "label": "Start hotkey (M tap)", "default": "CTRL+WIN+SHIFT" },
-      { "key": "stopKeys", "fieldType": "string", "label": "Stop key (M tap)", "default": "CTRL+WIN+SHIFT" },
+      { "key": "startKeys", "fieldType": "string", "label": "Hotkey 0 VOICE (M cycles, RIGHT sends)", "default": "CTRL+WIN+SHIFT" },
+      { "key": "enterKeys", "fieldType": "string", "label": "Hotkey 1 ENTER", "default": "ENTER" },
+      { "key": "deleteKeys", "fieldType": "string", "label": "Hotkey 2 DEL", "default": "BACKSPACE" },
       { "key": "holdKeys", "fieldType": "string", "label": "Hold key (M long-press, held down)", "default": "ALT+WIN" },
-      { "key": "enterKeys", "fieldType": "string", "label": "Send key", "default": "ENTER" },
-      { "key": "deleteKeys", "fieldType": "string", "label": "Delete key", "default": "BACKSPACE" },
+      { "key": "recDir", "fieldType": "string", "label": "Recording folder (empty = Documents\\box0-rec)", "default": "" },
+      { "key": "micGain", "fieldType": "number", "label": "Mic track gain in mix", "default": 1.0, "min": 0.1, "max": 10, "step": 0.1 },
+      { "key": "sysGain", "fieldType": "number", "label": "System track gain in mix", "default": 1.0, "min": 0.1, "max": 10, "step": 0.1 },
       { "key": "port", "fieldType": "number", "label": "UDP port", "default": 9125, "min": 1024, "max": 65535 }
     ]
   }

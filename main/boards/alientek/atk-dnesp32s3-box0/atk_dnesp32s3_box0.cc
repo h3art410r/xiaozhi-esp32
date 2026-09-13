@@ -103,6 +103,16 @@ private:
     int mic_wave_hist_[20] = {};
     lv_timer_t* mic_wave_timer_ = nullptr;
     static constexpr int kMicVoicePort = 9125;
+    // Continuous-recording + hotkey model: recording runs for the whole page
+    // session (auto-start on connect); L/R cycle the desktop hotkey shown on
+    // screen, M sends it.
+    int mic_hotkey_idx_ = 0;
+    lv_obj_t* mic_rec_label_ = nullptr;
+    lv_obj_t* mic_key_label_ = nullptr;
+    int64_t mic_rec_start_ms_ = 0;
+    int mic_rec_last_sec_ = -1;
+    static constexpr const char* kMicHotkeyNames[] = {"VOICE", "ENTER", "DEL"};
+    static constexpr int kMicHotkeyCount = 3;
 
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
@@ -740,10 +750,42 @@ private:
     }
 
     void MicTaskRun() {
-        int sock = -1;
-        bool connected = false;
+        // Recording is tied to the page session: every successful connection
+        // starts a new recording on the PC (REC_START), every disconnect or
+        // page exit ends it (REC_STOP). Reconnects automatically while open.
+        while (!mic_task_stop_) {
+            int sock = MicConnectSession();
+            if (sock < 0) {
+                if (!mic_task_stop_) {
+                    MicSetStatus("Reconnecting...");
+                    for (int i = 0; i < 10 && !mic_task_stop_; i++) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+                }
+                continue;
+            }
+            // Connected: stream and record continuously until the link drops
+            mic_streaming_ = true;
+            MicSetStatus("Streaming...", true);
+            mic_rec_start_ms_ = MicNowMs();
+            mic_rec_last_sec_ = -1;
+            MicSignalPc("REC_START");
+            MicStreamLoop(sock);
+            close(sock);
+            mic_streaming_ = false;
+            MicSignalPc("REC_STOP");
+        }
+        if (mic_engine_muted_) {
+            Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
+            mic_engine_muted_ = false;
+        }
+        ESP_LOGI(TAG, "Mic task exited");
+    }
 
-        // 1. Discover the MicYou desktop through mDNS
+    // Discover MicYou over mDNS and perform the TCP handshake.
+    // Returns the connected socket or -1 (status label already updated).
+    int MicConnectSession() {
+        int sock = -1;
         MicSetStatus("Searching PC...");
         esp_ip4_addr_t server_ip;
         server_ip.addr = 0;
@@ -773,10 +815,7 @@ private:
                 mdns_query_results_free(results);
             }
             if (server_ip.addr == 0) {
-                MicSetStatus("PC not found, retry...");
-                for (int i = 0; i < 20 && !mic_task_stop_; i++) {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                }
+                return -1;  // outer loop retries
             }
         }
         if (server_ip.addr != 0) {
@@ -786,7 +825,6 @@ private:
             mic_pc_ip_ = server_ip;
         }
 
-        // 2. TCP connect + protocol handshake
         if (!mic_task_stop_ && server_ip.addr != 0) {
             MicSetStatus("Connecting...");
             sock = (int)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -829,35 +867,33 @@ private:
                         MicRecvExact(sock, hs, sizeof(hs), 5000) == 0 &&
                         memcmp(hs, "MicYouCheck2", 12) == 0) {
                         size_t flen = MicBuildConnectFrame(mic_frame_buf_, sizeof(mic_frame_buf_));
-                        connected = flen > 0 && MicSendAll(sock, mic_frame_buf_, flen) == 0;
+                        if (flen > 0 && MicSendAll(sock, mic_frame_buf_, flen) == 0) {
+                            // Non-blocking + TCP_NODELAY for the streaming loop
+                            flags = fcntl(sock, F_GETFL, 0);
+                            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+                            int one = 1;
+                            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                            mic_rx_len_ = 0;
+                            mic_seq_ = 0;
+                            return sock;
+                        }
                     }
-                    // Non-blocking + TCP_NODELAY for the streaming loop
-                    flags = fcntl(sock, F_GETFL, 0);
-                    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-                    int one = 1;
-                    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
                 }
-                if (!connected) {
-                    ESP_LOGW(TAG, "MicYou connect/handshake failed");
-                    MicSetStatus("Connect failed, M: retry");
-                    close(sock);
-                    sock = -1;
-                }
+                ESP_LOGW(TAG, "MicYou connect/handshake failed");
+                MicSetStatus("Connect failed, retrying...");
+                close(sock);
+                sock = -1;
             } else {
-                MicSetStatus("Socket error, M: retry");
+                MicSetStatus("Socket error, retrying...");
             }
-        } else if (!mic_task_stop_) {
-            MicSetStatus("Discovery failed, M: retry");
         }
+        return -1;
+    }
 
-        // 3. Main loop: keepalive pings when idle, PCM frames when streaming
-        if (connected) {
-            MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected", mic_streaming_);
-        }
+    // Push PCM frames while mic_streaming_ is set; returns on link failure.
+    void MicStreamLoop(int sock) {
         int64_t last_ping_ms = 0;
-        mic_rx_len_ = 0;
-        mic_seq_ = 0;
-        while (!mic_task_stop_ && connected) {
+        while (!mic_task_stop_) {
             if (mic_streaming_) {
                 if (!mic_engine_muted_) {
                     // Take over the microphone from the audio input task
@@ -891,11 +927,11 @@ private:
                     size_t flen = MicBuildAudioFrame(mic_frame_buf_, sizeof(mic_frame_buf_),
                                                      (const uint8_t*)pcm, nsamples * sizeof(int16_t));
                     if (flen == 0 || MicSendAll(sock, mic_frame_buf_, flen) != 0) {
-                        MicSetStatus("Send failed, M: retry");
+                        MicSetStatus("Send failed, retrying...");
                         break;
                     }
                     if (!MicDrainRx(sock)) {
-                        MicSetStatus("Disconnected, M: retry");
+                        MicSetStatus("Disconnected, retrying...");
                         break;
                     }
                 } else {
@@ -904,7 +940,7 @@ private:
             } else {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 if (!MicDrainRx(sock)) {
-                    MicSetStatus("Disconnected, M: retry");
+                    MicSetStatus("Disconnected, retrying...");
                     break;
                 }
                 int64_t now = MicNowMs();
@@ -912,52 +948,64 @@ private:
                     last_ping_ms = now;
                     size_t flen = MicBuildTimestampFrame(mic_frame_buf_, sizeof(mic_frame_buf_), 0x2A, now);
                     if (flen == 0 || MicSendAll(sock, mic_frame_buf_, flen) != 0) {
-                        MicSetStatus("Disconnected, M: retry");
+                        MicSetStatus("Disconnected, retrying...");
                         break;
                     }
                 }
             }
         }
-
-        // 4. Cleanup
-        if (sock >= 0) {
-            close(sock);
-        }
-        if (mic_engine_muted_) {
-            Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
-            mic_engine_muted_ = false;
-        }
-        mic_streaming_ = false;
-        ESP_LOGI(TAG, "Mic task exited");
     }
 
-    void ToggleMicStreaming() {
-        if (mic_task_handle_ == nullptr) {
-            // (Re)connect to the desktop
-            mic_task_stop_ = false;
-            mic_streaming_ = false;
-            mic_rx_len_ = 0;
-            xTaskCreate(MicTaskEntry, "box0_mic", 8192, this, 5, &mic_task_handle_);
-            return;
+    void MicUpdateKeyLabel() {
+        DisplayLockGuard lock(display_);
+        if (mic_key_label_ != nullptr) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "KEY: %s", kMicHotkeyNames[mic_hotkey_idx_]);
+            lv_label_set_text(mic_key_label_, buf);
         }
-        mic_streaming_ = !mic_streaming_;
-        MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected", mic_streaming_);
-        MicSignalPc(mic_streaming_ ? "VOICE_START" : "VOICE_STOP");
     }
 
-    // Hold-to-talk (Doubao long-press mode): M held -> Right Alt held down,
-    // M released -> Right Alt released. Streaming runs for the hold duration.
-    static void MicHoldTimerCb(void* arg) {
-        static_cast<atk_dnesp32s3_box0*>(arg)->MicHoldStart();
+    // L/R in the mic page: cycle the desktop hotkey (shown on screen);
+    // M sends it (see the button handlers). dir: -1 = prev, +1 = next.
+    void MicCycleHotkey(int dir) {
+        mic_voice_active_ = false;  // manual switch takes over the VOICE flow
+        mic_hotkey_idx_ = (mic_hotkey_idx_ + dir + kMicHotkeyCount) % kMicHotkeyCount;
+        MicUpdateKeyLabel();
     }
 
-    // Enter hold-to-talk after a short grace period from press-down, not after
-    // the button driver's long-press threshold (~1.5 s), so recording starts
-    // almost immediately when M is held.
+    // VOICE two-press flow: first press starts voice input (stay on VOICE so
+    // the next press stops it and drops the text into the chat box), second
+    // press stops it — only then pre-select Enter for the final send.
+    bool mic_voice_active_ = false;
+
+    void MicSendHotkey() {
+        char msg[24];
+        int idx = mic_hotkey_idx_;
+        snprintf(msg, sizeof(msg), "KEY_SEND %d", idx);
+        MicSignalPc(msg);
+        if (idx == 0) {
+            if (mic_voice_active_) {
+                mic_voice_active_ = false;
+                mic_hotkey_idx_ = 1;
+                MicUpdateKeyLabel();
+            } else {
+                mic_voice_active_ = true;
+            }
+        } else {
+            mic_voice_active_ = false;
+        }
+    }
+
+    // M long-press toggles recording: hold M ~0.8 s to pause, again to resume.
+    // The audio stream itself stays connected while paused (idle keepalive).
+    static void MicLongPressCb(void* arg) {
+        static_cast<atk_dnesp32s3_box0*>(arg)->MicToggleRecording();
+    }
+
     void ArmMicHoldTimer() {
         if (mic_hold_timer_ == nullptr) {
             esp_timer_create_args_t args = {};
-            args.callback = &MicHoldTimerCb;
+            args.callback = &MicLongPressCb;
             args.arg = this;
             args.dispatch_method = ESP_TIMER_TASK;
             args.name = "mic_hold";
@@ -966,39 +1014,30 @@ private:
             }
         }
         esp_timer_stop(mic_hold_timer_);
-        esp_timer_start_once(mic_hold_timer_, 350 * 1000);
+        esp_timer_start_once(mic_hold_timer_, 800 * 1000);
     }
 
-    void MicHoldStart() {
+    void MicToggleRecording() {
         if (mic_hold_) {
             return;
         }
-        mic_hold_ = true;
-        if (mic_task_handle_ == nullptr) {
-            mic_task_stop_ = false;
+        mic_hold_ = true;  // long-press consumed; suppress the click on release
+        if (mic_streaming_) {
             mic_streaming_ = false;
-            mic_rx_len_ = 0;
-            xTaskCreate(MicTaskEntry, "box0_mic", 8192, this, 5, &mic_task_handle_);
+            MicSetStatus("Recording paused");
+            MicSignalPc("REC_STOP");
+        } else {
+            mic_streaming_ = true;
+            mic_rec_start_ms_ = MicNowMs();
+            mic_rec_last_sec_ = -1;
+            MicSetStatus("Streaming...", true);
+            MicSignalPc("REC_START");
         }
-        mic_streaming_ = true;
-        MicSetStatus("Streaming...", true);
-        MicSignalPc("VOICE_HOLD_START");
     }
 
-    void MicHoldStop() {
-        if (!mic_hold_) {
-            return;
-        }
-        mic_hold_ = false;
-        mic_hold_consumed_ = true;  // suppress the click event on release
-        mic_streaming_ = false;
-        MicSetStatus("Connected");
-        MicSignalPc("VOICE_HOLD_STOP");
-    }
-
-    // Notify the PC-side voice_link helper over UDP so it can press the
-    // voice-input hotkey (start/stop) / Enter (send) / Backspace (delete) on
-    // the desktop.
+    // Notify the PC-side voice_link plugin over UDP: desktop hotkeys
+    // (VOICE_HOLD_*, KEY_SEND n), recording control (REC_START/STOP) and the
+    // legacy VOICE_DELETE message all go through this channel.
     void MicSignalPc(const char* msg) {
         if (mic_pc_ip_.addr == 0) {
             return;
@@ -1024,8 +1063,8 @@ private:
     void MicWaveTick() {
         auto disp = lv_display_get_default();
         int h = lv_display_get_vertical_resolution(disp);
-        int center_y = h - 56;
-        const int kMaxBar = 48;  // half-height; bars extend both ways from the center line
+        int center_y = h - 36;
+        const int kMaxBar = 28;  // half-height; bars extend both ways from the center line
         int32_t level = mic_level_.exchange(0);
         int v = 0;
         if (mic_streaming_) {
@@ -1042,6 +1081,28 @@ private:
             int bh = mic_wave_hist_[i] * 2 + 2;
             lv_obj_set_size(mic_bars_[i], 7, bh);
             lv_obj_set_pos(mic_bars_[i], 12 + i * 11, center_y - bh / 2);
+        }
+        // Recording clock (only rewrite the label once per second)
+        if (mic_rec_label_ != nullptr) {
+            int sec = -1;
+            if (mic_streaming_ && mic_rec_start_ms_ > 0) {
+                sec = (int)((MicNowMs() - mic_rec_start_ms_) / 1000);
+            }
+            if (sec != mic_rec_last_sec_) {
+                mic_rec_last_sec_ = sec;
+                // runs on the LVGL task (like the bar updates above), no lock
+                if (mic_rec_label_ != nullptr) {
+                    if (sec >= 0) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "REC %02d:%02d", sec / 60, sec % 60);
+                        lv_label_set_text(mic_rec_label_, buf);
+                        lv_obj_set_style_text_color(mic_rec_label_, lv_color_hex(0xEF4444), 0);
+                    } else {
+                        lv_label_set_text(mic_rec_label_, "REC --:--");
+                        lv_obj_set_style_text_color(mic_rec_label_, lv_color_hex(0x6B7280), 0);
+                    }
+                }
+            }
         }
     }
 
@@ -1072,7 +1133,7 @@ private:
             if (font != nullptr) {
                 lv_obj_set_style_text_font(title, font, 0);
             }
-            lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+            lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
 
             char ip_str[48] = "IP: -";
             esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -1086,7 +1147,7 @@ private:
             if (font != nullptr) {
                 lv_obj_set_style_text_font(ip_label, font, 0);
             }
-            lv_obj_align(ip_label, LV_ALIGN_TOP_MID, 0, 56);
+            lv_obj_align(ip_label, LV_ALIGN_TOP_MID, 0, 44);
 
             mic_pc_label_ = lv_label_create(mic_layer_);
             lv_label_set_text(mic_pc_label_, "PC: -");
@@ -1094,7 +1155,7 @@ private:
             if (font != nullptr) {
                 lv_obj_set_style_text_font(mic_pc_label_, font, 0);
             }
-            lv_obj_align(mic_pc_label_, LV_ALIGN_TOP_MID, 0, 86);
+            lv_obj_align(mic_pc_label_, LV_ALIGN_TOP_MID, 0, 72);
 
             mic_status_label_ = lv_label_create(mic_layer_);
             lv_label_set_text(mic_status_label_, "Searching PC...");
@@ -1102,13 +1163,33 @@ private:
             if (font != nullptr) {
                 lv_obj_set_style_text_font(mic_status_label_, font, 0);
             }
-            lv_obj_align(mic_status_label_, LV_ALIGN_TOP_MID, 0, 122);
+            lv_obj_align(mic_status_label_, LV_ALIGN_TOP_MID, 0, 100);
+
+            // Recording clock (red while recording, gray when idle)
+            mic_rec_label_ = lv_label_create(mic_layer_);
+            lv_label_set_text(mic_rec_label_, "REC --:--");
+            lv_obj_set_style_text_color(mic_rec_label_, lv_color_hex(0x6B7280), 0);
+            if (font != nullptr) {
+                lv_obj_set_style_text_font(mic_rec_label_, font, 0);
+            }
+            lv_obj_align(mic_rec_label_, LV_ALIGN_TOP_MID, 0, 128);
+
+            // Currently selected desktop hotkey (M cycles it, RIGHT sends it)
+            mic_key_label_ = lv_label_create(mic_layer_);
+            char key_buf[24];
+            snprintf(key_buf, sizeof(key_buf), "KEY: %s", kMicHotkeyNames[mic_hotkey_idx_]);
+            lv_label_set_text(mic_key_label_, key_buf);
+            lv_obj_set_style_text_color(mic_key_label_, lv_color_hex(0x4ADE80), 0);
+            if (font != nullptr) {
+                lv_obj_set_style_text_font(mic_key_label_, font, 0);
+            }
+            lv_obj_align(mic_key_label_, LV_ALIGN_TOP_MID, 0, 156);
 
             // Live audio level waveform (updated by MicWaveTick while streaming)
             for (int i = 0; i < 20; i++) {
                 mic_bars_[i] = lv_obj_create(mic_layer_);
                 lv_obj_set_size(mic_bars_[i], 7, 2);
-                lv_obj_set_pos(mic_bars_[i], 12 + i * 11, h - 57);
+                lv_obj_set_pos(mic_bars_[i], 12 + i * 11, h - 37);
                 lv_obj_set_style_bg_color(mic_bars_[i], lv_color_hex(0x3B9EFF), 0);
                 lv_obj_set_style_bg_opa(mic_bars_[i], LV_OPA_COVER, 0);
                 lv_obj_set_style_border_width(mic_bars_[i], 0, 0);
@@ -1141,11 +1222,10 @@ private:
         }
         if (mic_hold_) {
             mic_hold_ = false;
-            MicSignalPc("VOICE_HOLD_STOP");
-        } else if (mic_streaming_) {
-            MicSignalPc("VOICE_STOP");
         }
+        // REC_STOP is sent by the mic task itself when its loop exits.
         mic_streaming_ = false;
+        mic_rec_start_ms_ = 0;
         mic_level_.store(0);
         // The mic task polls the stop flag every 20-100 ms; the discovery or
         // connect phases may need up to ~3 s to notice it.
@@ -1166,6 +1246,8 @@ private:
                 mic_layer_ = nullptr;
                 mic_status_label_ = nullptr;
                 mic_pc_label_ = nullptr;
+                mic_rec_label_ = nullptr;
+                mic_key_label_ = nullptr;
                 for (int i = 0; i < 20; i++) {
                     mic_bars_[i] = nullptr;
                 }
@@ -1240,7 +1322,8 @@ private:
                 mic_hold_consumed_ = false;
                 return;
             }
-            ToggleMicStreaming();
+            // M sends the desktop hotkey selected with L/R
+            MicSendHotkey();
             return;
         }
         if (menu_visible_) {
@@ -1289,7 +1372,8 @@ private:
                 esp_timer_stop(mic_hold_timer_);
             }
             if (mic_hold_) {
-                MicHoldStop();
+                mic_hold_ = false;
+                mic_hold_consumed_ = true;  // suppress the click event on release
                 return;
             }
             if (LcdStatus_ == kDevicelcdbacklightOff) {
@@ -1312,7 +1396,7 @@ private:
 
         middle_button_.OnLongPress([this]() {
             if (mic_layer_ != nullptr) {
-                MicHoldStart();
+                // recording toggle is handled by the 800 ms press-down timer
                 return;
             }
             auto& app = Application::GetInstance();
@@ -1357,8 +1441,8 @@ private:
             return;
         }
         if (mic_layer_ != nullptr) {
-            // Delete a misrecognized character: voice_link turns this into Backspace
-            MicSignalPc("VOICE_DELETE");
+            // Previous desktop hotkey (M sends the selected one)
+            MicCycleHotkey(-1);
             return;
         }
         if (menu_visible_) {
@@ -1419,8 +1503,8 @@ private:
             return;
         }
         if (mic_layer_ != nullptr) {
-            // Confirm/send the recognized text: voice_link turns this into Enter
-            MicSignalPc("VOICE_ENTER");
+            // Next desktop hotkey (M sends the selected one)
+            MicCycleHotkey(1);
             return;
         }
         if (menu_visible_) {
