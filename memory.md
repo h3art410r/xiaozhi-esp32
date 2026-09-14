@@ -14,6 +14,39 @@
 - 当前配置：iKuai-1024 + Ziroom901_1（自如 2.4G，5G 后缀的 _5G 网络 ESP32-S3 用不了，SSID 大小写敏感，正确拼写是 Ziroom901_1）。已实测连上 Ziroom901_1 且 MQTT 激活成功。
 - MicYou 插件（box0-voice-link）在 A 机用 VS2022 BuildTools 的 MSVC 编译：powershell -ExecutionPolicy Bypass -File pc-tools/box0-voice-link/build_msvc.ps1（手工设 INCLUDE/LIB/PATH，不走 vcvars——cmd 对带空格引号路径处理在这台机器上不可靠）。源码需 #include <stdlib.h>（MSVC 严格）。安装用 micyou-cli plugin enable dev.box0.voicelink（会生成 plugin-state.json），重启 MicYou 后验证 UDP 9125 被 micyou.exe 占用。
 
+## 2026-09-07 UI 性能优化 + 编译改回全核默认
+- 用户反馈菜单翻页/进出"不够跟手"。排查结论：按键链本身已不错（iot_button 扫描定时器 5ms、消抖 10ms、回调全异步），CPU 频率原本就 240MHz 双核，**主因是 LVGL 任务优先级被上游 board 代码压到 1**（低于推流等任务，重绘制被抢），加上无双缓冲、刷新周期 20ms。改动（main/display/lcd_display.cc SpiLcdDisplay 构造函数）：
+  - lvgl_port_cfg：task_priority 1→8，timer_period_ms 20→2，task_max_sleep_ms→10（affinity 保持 core 1）
+  - display_cfg：buffer_size width_*20→width_*32，double_buffer false→true（buff_dma 原本=1）。双缓冲多占内部 RAM 约 30KB（S3 内部 RAM 充裕），若某板型刷后 LVGL 初始化报错需回退此项
+  - 板级 atk_dnesp32s3_box0.cc 菜单弹出检查定时器 500ms→100ms（约 1842 行）
+  - 理论交互链路 ~100ms+ → ~30ms 内。备选压榨方向（未做）：消抖 2→1 tick（误触风险）、LVGL 刷新周期
+- 单核编译默认撤销：实测 N150 上单核全流程太慢，用户要求改回全核。box0_build_flash.ps1 删掉 CPU 型号自动检测段，**默认全核编译**，仅 BOX0_ONE_CORE=1 时强制单核（注释同步更新）
+- 第二轮"主菜单不跟手"修复（无线麦页因反馈不依赖 click 已变快，主菜单无感）：根因是**导航全绑 OnClick（抬起才触发）**，按压全程是死时间，渲染优化只省尾巴。改动（atk_dnesp32s3_box0.cc）：
+  - 左/右导航（主菜单+About+Power 页）和 M 进入菜单项改到 OnPressDown 按下瞬间触发；注意 Button 类每事件单回调槽，OnPressDown 合并进原 MicMuteFor 处理器而非重复注册
+  - 主菜单按住 L/R 连发：40ms 周期 esp_timer，按下 400ms 后每 120ms 一项（读 GPIO 电平判释放，松开即停；仅主菜单连发，About/Power 页不连发以保留"长按左退出"手势）
+  - 防重入：nav_press_consumed_/m_press_consumed_ 吞掉抬起 click；屏保昏暗中按下即唤醒并吞掉 release（防抬起误触发音量/对话）；M 长按被 consumed 时屏蔽（防菜单页里既激活又触发睡眠/WiFi 配网逻辑）；右键长按音量拉满在菜单/About/Power 页禁用（否则按住连发到 2s 音量爆炸）
+  - 菜单激活逻辑抽成 ActivateMenuItem() 供 press-down/click 复用
+- 已全核编译 + 刷机（hash 校验通过）；跟手感待实机确认
+
+## 2026-09-07 主菜单分页 + 提示弱化 + 单核编译限制
+- 主菜单分页：每页 3 项共 2 页（kMenuItemsPerPage=3），行高 56 间距 64（y=16+i*64，末行底 200，上下均衡），页码 x/y 放右上角 y=10（暗色 0x424950，曾放右下角与底部提示重叠）；建行逻辑抽成 RenderMenuPage()（跨页重建行、同页只改高亮），menu_index_ 仍全局 0-5，按键路由零改动；左右循环 %kMenuItemCount 跨页自动翻。底部提示 L/R: Switch M: Enter 颜色 0x8A939B→0x424950 弱化。页码 snprintf 又踩 -Werror=format-truncation，%100 收窄解决（About 页同款）
+- box0_build_flash.ps1 单核限制：CPU 型号匹配 N100/N150/N200/N250/N97/Celeron/Pentium 时自动把脚本进程 ProcessorAffinity=1（子进程编译器继承亲和性，比限 ninja 任务数更彻底），已实测 N150 生效；BOX0_ONE_CORE=1/0 手动强制开/关。B 机 Ultra7 不受影响。单核增量编译+刷机全流程已验证通过。**⚠️ 此默认已被下一条撤销**（N150 单核太慢），现仅 BOX0_ONE_CORE=1 显式开启
+
+## 2026-09-07 主菜单 Power 子页面（关机/重启）
+- 菜单扩 6 项（行高 32 间距 34 适配 240px，防最后一项和底部提示重叠）：AI Voice / Wireless Mic / Flappy Bird / Dino Run / About / Power；左右循环数改 %6。Power 子页面仿 About 页盖在菜单上：Power Off / Reboot 两项，左右切换、M 执行、长按左返回；M 长压在电源页屏蔽防误触配网/休眠
+- 关机复用现有断电序列（与低电压自动关机/休眠关机同源）：esp_timer_stop(power_manager_->timer_handle_) → CHG_CTRL_PIN=0 → 100ms → SYS_POW_PIN=0 松自保持。**仅电池供电（power_status_==kDeviceBatterySupply）时执行**；插电（Type-C 维持电源闩锁，硬切无意义）提示 Please unplug USB first。重启直接 esp_restart()
+- 已刷机验证；Reboot 实机可用，Power Off 断电逻辑与现有关机路径逐行一致但建议电池环境实测一次
+
+## 2026-09-07 无线麦按键音效
+- 需求：无线麦页面每个按键要有对应功能的音效，风格现代灵动、适合 ESP32 播放
+- 实现：不走 OGG 资产（A 机无 ffmpeg，且运行时合成零依赖、两台机器通用）。atk_dnesp32s3_box0.cc 新增 PlayMicCue()：运行时合成单声道 PCM（正弦+2/3 次谐波，快起音+指数衰减，段间相位连续防爆音），直接 codec->OutputData() 写 ES8311（音量跟随系统音量）；播前补 20ms 静音掩 PA 上电 pop，播完等 DMA 尾音排干再恢复 output 关闭
+- 四个音效（MicCueSegment 表驱动，频率滑变为指数 glide）：M 开始推流=C6-E6-G6 上行大三和弦琶音；M 停止=G6-E6-C6 下行琶音；右键发送=900→2400Hz 快速上扫；长按左键退出=1200→480Hz 柔和下滑
+- 时序讲究：开始音在 mic_streaming_=true 之前播、停止音在 VOICE_STOP 之后播，避免音效被串流发到 PC
+- 已刷机（COM3）验证编译烧录通过；音效实听效果待用户确认
+- 后续迭代（用户确认音效满意后）：按键消震——按键咔哒声经机身传导进板载麦克风，推流时被采到、波形图跟着炸。方案：OnPressDown（按下瞬间，咔哒声发生在按下而非 OnClick 抬起时）给 M/左/右注册 MicMuteFor(250ms)（仅无线麦页面），推流任务读帧时若处于 mic_mute_until_ms_ 窗口内就把该帧 PCM 清零再发（发静音不断包序、不触发 PC 踢线），波形峰值同步为 0 由 3/4 衰减平滑回落。已刷机验证
+- 修复"连续输入时第二次起消震失效"：根因是 iot_button 的按键扫描和回调全在 esp_timer 任务上（所有按键共用一个 10ms 定时器），PlayMicCue 阻塞式 I2S 写会占住该任务 100~450ms——期间按键根本扫不到，下一次按下的 MicMuteFor 最多晚 ~450ms 才开窗口，震动噪音早发走了（首次按键灵是因为当时没在播音效；波形"卡"也是同一根因）。修法：音效播放挪到独立 box0_cue 任务（优先级 3，低于推流任务 5），按键回调只留原子操作/LVGL/UDP 不再阻塞；RequestMicCue 原子请求、MicCueTask 消费；开始推流分支因音效异步改 MicMuteFor(500) 盖住音效本身；ExitMicPage 停止 cue 任务（先播完挂起的退出音效再退出）。已刷机验证
+- 修复"按终止键偶发与 PC 断联"（缓解+取证）：socket 协议代码复查无问题，断联只可能三个出口（发送失败 errno / 服务器关连接 recv=0 / WiFi 瞬断），仅凭代码无法断定根因。改动：(1) MicTaskRun 拆出 MicRunSession（单次 mDNS+握手+主循环），链路断自动重连最多 3 次（间隔 1.5s，显示 Reconnecting...），3 次失败才 M: retry；唤醒词恢复挪到任务真正结束只执行一次。(2) 三个断点路径全加 ESP_LOGW 带 errno，MicDrainRx 收服务器关闭有专门日志，RequestMicCue 补 xTaskCreate 失败保护。真因待复现时从串口日志确认（挂 idf.py monitor 看 W 级日志）。已刷机验证
+
 ## 2026-09-06：正点原子 ESP32 AI BOX0 资料包
 
 资料路径：`D:\Workspace\xiaozhi-esp32\【正点原子】ESP32 AI BOX0资料（A盘）`

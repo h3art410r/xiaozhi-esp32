@@ -16,9 +16,20 @@
 #   - Tools/temp = redirected to C:\Workspace only when the C:\Workspace
 #                  ESP-IDF copy is selected; ESP-IDF defaults otherwise.
 #   - Serial port= $env:BOX0_PORT, else the single available COM port, else COM3.
+#   - CPU limit  = full-core build by default; set BOX0_ONE_CORE=1 to pin the
+#                  build to one core when the host must stay responsive.
 $ErrorActionPreference = 'Continue'
 if (Test-Path Env:MSYSTEM) { Remove-Item Env:MSYSTEM }
 if (Test-Path Env:MSYS2_PATH_TYPE) { Remove-Item Env:MSYS2_PATH_TYPE }
+
+# Pin the whole build (compiler child processes inherit affinity) to one core.
+# Opt-in only: BOX0_ONE_CORE=1. Default is a full-core build - single-core was
+# tried on the N150 host but proved too slow.
+$oneCore = $env:BOX0_ONE_CORE
+if ($oneCore -eq '1') {
+    [System.Diagnostics.Process]::GetCurrentProcess().ProcessorAffinity = 1
+    Write-Host '== single-core build mode (BOX0_ONE_CORE) =='
+}
 
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 

@@ -26,6 +26,7 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include <esp_netif.h>
 #include <esp_chip_info.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
 #include <lwip/sockets.h>
@@ -36,6 +37,7 @@
 #include <errno.h>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -59,19 +61,35 @@ private:
     esp_timer_handle_t wake_timer_handle_;
     esp_lcd_panel_io_handle_t panel_io = nullptr;
     esp_lcd_panel_handle_t panel = nullptr;
-    // Boot menu state
+    // Boot menu state (paged: 3 items per page, L/R wraps across pages)
+    static constexpr int kMenuItemCount = 6;
+    static constexpr int kMenuItemsPerPage = 3;
     lv_obj_t* menu_layer_ = nullptr;
-    lv_obj_t* menu_items_[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    lv_obj_t* menu_items_[kMenuItemsPerPage] = {nullptr, nullptr, nullptr};
     int menu_index_ = 0;
+    int menu_page_ = -1;
+    lv_obj_t* menu_page_label_ = nullptr;
     bool menu_visible_ = false;
     lv_obj_t* about_layer_ = nullptr;
     lv_obj_t* about_body_label_ = nullptr;
     lv_obj_t* about_title_label_ = nullptr;
     int about_page_ = 0;
     static constexpr int kAboutPages = 2;
+    // Power submenu state ("Power Off" / "Reboot"), layered over the boot menu
+    lv_obj_t* power_layer_ = nullptr;
+    lv_obj_t* power_items_[2] = {nullptr, nullptr};
+    lv_obj_t* power_hint_label_ = nullptr;
+    int power_index_ = 0;
     std::shared_ptr<LvglFont> menu_font_ = nullptr;
     esp_timer_handle_t menu_timer_ = nullptr;
     bool menu_pending_ = true;
+    // Press-down navigation: menu/pages react on press, not on release; the
+    // main menu also scrolls continuously while L/R is held.
+    esp_timer_handle_t nav_repeat_timer_ = nullptr;
+    int nav_repeat_dir_ = 0;
+    uint32_t nav_repeat_ticks_ = 0;
+    bool nav_press_consumed_ = false;
+    bool m_press_consumed_ = false;
 
     // Games; logic lives in box0_games.h and is shared with the PC simulator
     Box0GamePlatform game_platform_;
@@ -96,6 +114,10 @@ private:
     uint8_t mic_frame_buf_[800];
     esp_ip4_addr_t mic_pc_ip_{};
     std::atomic<int32_t> mic_level_{0};
+    std::atomic<int64_t> mic_mute_until_ms_{0};
+    std::atomic<int> mic_cue_request_{-1};
+    TaskHandle_t mic_cue_task_handle_ = nullptr;
+    std::atomic<bool> mic_cue_task_stop_{false};
     lv_obj_t* mic_bars_[20] = {};
     int mic_wave_hist_[20] = {};
     lv_timer_t* mic_wave_timer_ = nullptr;
@@ -306,36 +328,87 @@ private:
         lv_obj_set_style_pad_all(menu_layer_, 0, 0);
         lv_obj_remove_flag(menu_layer_, LV_OBJ_FLAG_SCROLLABLE);
 
-        const char* texts[5] = { "AI Voice", "Wireless Mic", "Flappy Bird", "Dino Run", "About" };
-        for (int i = 0; i < 5; i++) {
-            lv_obj_t* row = lv_obj_create(menu_layer_);
-            lv_obj_set_size(row, w, 36);
-            lv_obj_set_pos(row, 0, 8 + i * 40);
-            lv_obj_set_style_radius(row, 0, 0);
-            lv_obj_set_style_pad_all(row, 0, 0);
-            lv_obj_set_style_bg_color(row, lv_color_hex(0x2F6FED), 0);
-            lv_obj_set_style_bg_opa(row, (i == menu_index_) ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(row, 0, 0);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_t* label = lv_label_create(row);
-            lv_label_set_text(label, texts[i]);
-            lv_obj_set_style_text_color(label, (i == menu_index_) ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x9AA4AD), 0);
-            if (font != nullptr) {
-                lv_obj_set_style_text_font(label, font, 0);
-            }
-            lv_obj_align(label, LV_ALIGN_LEFT_MID, 22, 0);
-            menu_items_[i] = row;
-        }
-
+        // Bottom hint kept deliberately dim so it does not compete with items
         lv_obj_t* hint = lv_label_create(menu_layer_);
         lv_label_set_text(hint, "L/R: Switch   M: Enter");
-        lv_obj_set_style_text_color(hint, lv_color_hex(0x8A939B), 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x424950), 0);
         if (font != nullptr) {
             lv_obj_set_style_text_font(hint, font, 0);
         }
         lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
 
+        menu_page_label_ = lv_label_create(menu_layer_);
+        lv_obj_set_style_text_color(menu_page_label_, lv_color_hex(0x424950), 0);
+        if (font != nullptr) {
+            lv_obj_set_style_text_font(menu_page_label_, font, 0);
+        }
+        lv_obj_align(menu_page_label_, LV_ALIGN_TOP_RIGHT, -8, 10);
+
+        menu_page_ = -1; // force the page (re)build below
+        RenderMenuPage();
         menu_visible_ = true;
+    }
+
+    // (Re)builds the menu rows for the page containing menu_index_ and updates
+    // the selection highlight plus the page indicator. Caller must hold the
+    // display lock.
+    void RenderMenuPage() {
+        auto disp = lv_display_get_default();
+        int w = lv_display_get_horizontal_resolution(disp);
+        const lv_font_t* font = GetMenuFont();
+        static const char* kTexts[kMenuItemCount] = {
+            "AI Voice", "Wireless Mic", "Flappy Bird", "Dino Run", "About", "Power",
+        };
+        int page = menu_index_ / kMenuItemsPerPage;
+        int npages = (kMenuItemCount + kMenuItemsPerPage - 1) / kMenuItemsPerPage;
+        if (page != menu_page_) {
+            for (int i = 0; i < kMenuItemsPerPage; i++) {
+                if (menu_items_[i] != nullptr) {
+                    lv_obj_delete(menu_items_[i]);
+                    menu_items_[i] = nullptr;
+                }
+            }
+            menu_page_ = page;
+            for (int i = 0; i < kMenuItemsPerPage; i++) {
+                int idx = page * kMenuItemsPerPage + i;
+                if (idx >= kMenuItemCount) {
+                    break;
+                }
+                lv_obj_t* row = lv_obj_create(menu_layer_);
+                lv_obj_set_size(row, w, 56);
+                lv_obj_set_pos(row, 0, 16 + i * 64);
+                lv_obj_set_style_radius(row, 0, 0);
+                lv_obj_set_style_pad_all(row, 0, 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x2F6FED), 0);
+                lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_t* label = lv_label_create(row);
+                lv_label_set_text(label, kTexts[idx]);
+                lv_obj_set_style_text_color(label, lv_color_hex(0x9AA4AD), 0);
+                if (font != nullptr) {
+                    lv_obj_set_style_text_font(label, font, 0);
+                }
+                lv_obj_align(label, LV_ALIGN_LEFT_MID, 22, 0);
+                menu_items_[i] = row;
+            }
+        }
+        for (int i = 0; i < kMenuItemsPerPage; i++) {
+            if (menu_items_[i] == nullptr) {
+                continue;
+            }
+            int idx = page * kMenuItemsPerPage + i;
+            lv_obj_set_style_bg_opa(menu_items_[i], (idx == menu_index_) ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_t* label = lv_obj_get_child(menu_items_[i], 0);
+            if (label != nullptr) {
+                lv_obj_set_style_text_color(label, (idx == menu_index_) ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x9AA4AD), 0);
+            }
+        }
+        if (menu_page_label_ != nullptr) {
+            char p[8];
+            snprintf(p, sizeof(p), "%d/%d", (page + 1) % 100, npages % 100);
+            lv_label_set_text(menu_page_label_, p);
+        }
     }
 
     void HideBootMenu() {
@@ -345,9 +418,11 @@ private:
         DisplayLockGuard lock(display_);
         lv_obj_delete(menu_layer_);
         menu_layer_ = nullptr;
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < kMenuItemsPerPage; i++) {
             menu_items_[i] = nullptr;
         }
+        menu_page_label_ = nullptr;
+        menu_page_ = -1;
         menu_visible_ = false;
     }
 
@@ -357,15 +432,82 @@ private:
         }
         menu_index_ = index;
         DisplayLockGuard lock(display_);
-        for (int i = 0; i < 5; i++) {
-            if (menu_items_[i] == nullptr) {
-                continue;
-            }
-            lv_obj_set_style_bg_opa(menu_items_[i], (i == menu_index_) ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            lv_obj_t* label = lv_obj_get_child(menu_items_[i], 0);
-            if (label != nullptr) {
-                lv_obj_set_style_text_color(label, (i == menu_index_) ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x9AA4AD), 0);
-            }
+        RenderMenuPage();
+    }
+
+    // Shared L/R navigation for the about/power/menu layers. Fires on press
+    // (not release) so the highlight tracks the finger. Returns true when the
+    // press was consumed; the caller must then ignore the release click.
+    bool NavSelection(int dir) {
+        if (about_layer_ != nullptr) {
+            SelectAboutPage((about_page_ + dir + kAboutPages) % kAboutPages);
+            return true;
+        }
+        if (power_layer_ != nullptr) {
+            SelectPowerItem((power_index_ + 1) % 2);
+            return true;
+        }
+        if (menu_visible_) {
+            SelectMenuItem((menu_index_ + dir + kMenuItemCount) % kMenuItemCount);
+            return true;
+        }
+        return false;
+    }
+
+    void StopNavRepeat() {
+        nav_repeat_dir_ = 0;
+        if (nav_repeat_timer_ != nullptr) {
+            esp_timer_stop(nav_repeat_timer_);
+        }
+    }
+
+    // Hold-to-repeat scrolling, main menu only (other pages keep their
+    // long-press gestures, so repeating there would fight them).
+    void StartNavRepeat(int dir) {
+        if (nav_repeat_timer_ == nullptr) {
+            return;
+        }
+        StopNavRepeat();
+        nav_repeat_dir_ = dir;
+        nav_repeat_ticks_ = 0;
+        esp_timer_start_periodic(nav_repeat_timer_, 40 * 1000);
+    }
+
+    void NavRepeatTick() {
+        if (nav_repeat_dir_ == 0) {
+            return;
+        }
+        gpio_num_t pin = nav_repeat_dir_ > 0 ? R_BUTTON_GPIO : L_BUTTON_GPIO;
+        if (gpio_get_level(pin) != 0 || !menu_visible_) {
+            StopNavRepeat();
+            return;
+        }
+        nav_repeat_ticks_++;
+        if (nav_repeat_ticks_ < 10) {
+            return;  // ~400 ms before repeat starts
+        }
+        if ((nav_repeat_ticks_ - 10) % 3 != 0) {
+            return;  // then ~every 120 ms
+        }
+        SelectMenuItem((menu_index_ + nav_repeat_dir_ + kMenuItemCount) % kMenuItemCount);
+    }
+
+    void ActivateMenuItem() {
+        if (menu_index_ == 0) {
+            HideBootMenu();
+        } else if (menu_index_ == 1) {
+            HideBootMenu();
+            ShowMicPage();
+        } else if (menu_index_ == 2) {
+            HideBootMenu();
+            StartGame();
+        } else if (menu_index_ == 3) {
+            HideBootMenu();
+            StartDinoGame();
+        } else if (menu_index_ == 4) {
+            ShowAboutPage();
+        } else {
+            ShowPowerPage();
         }
     }
 
@@ -502,6 +644,127 @@ private:
         about_body_label_ = nullptr;
         about_title_label_ = nullptr;
         about_page_ = 0;
+    }
+
+    // ---------------- Power submenu ("Power Off" / "Reboot") ----------------
+    // Hard power cut, same sequence as the battery shutdown paths: release
+    // the charger control line, then drop the self-hold power line.
+    void PowerOffBoard() {
+        esp_timer_stop(power_manager_->timer_handle_);
+        gpio_set_level(CHG_CTRL_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(SYS_POW_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    void ConfirmPowerItem() {
+        if (power_index_ == 0) {
+            // Power Off: only meaningful on battery; on USB supply the latch
+            // stays fed, so ask the user to unplug instead.
+            if (power_status_ == kDeviceBatterySupply) {
+                if (power_hint_label_ != nullptr) {
+                    DisplayLockGuard lock(display_);
+                    lv_label_set_text(power_hint_label_, "Powering off...");
+                }
+                vTaskDelay(pdMS_TO_TICKS(300));
+                PowerOffBoard();
+            } else if (power_hint_label_ != nullptr) {
+                DisplayLockGuard lock(display_);
+                lv_label_set_text(power_hint_label_, "Please unplug USB first");
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
+    }
+
+    void ShowPowerPage() {
+        if (power_layer_ != nullptr) {
+            return;
+        }
+        DisplayLockGuard lock(display_);
+        auto disp = lv_display_get_default();
+        int w = lv_display_get_horizontal_resolution(disp);
+        int h = lv_display_get_vertical_resolution(disp);
+        const lv_font_t* font = GetMenuFont();
+
+        power_layer_ = lv_obj_create(lv_layer_top());
+        lv_obj_set_size(power_layer_, w, h);
+        lv_obj_set_pos(power_layer_, 0, 0);
+        lv_obj_set_style_bg_color(power_layer_, lv_color_hex(0x101418), 0);
+        lv_obj_set_style_bg_opa(power_layer_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(power_layer_, 0, 0);
+        lv_obj_set_style_radius(power_layer_, 0, 0);
+        lv_obj_set_style_pad_all(power_layer_, 0, 0);
+        lv_obj_remove_flag(power_layer_, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* title = lv_label_create(power_layer_);
+        lv_label_set_text(title, "Power");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+        if (font != nullptr) {
+            lv_obj_set_style_text_font(title, font, 0);
+        }
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
+
+        const char* texts[2] = { "Power Off", "Reboot" };
+        for (int i = 0; i < 2; i++) {
+            lv_obj_t* row = lv_obj_create(power_layer_);
+            lv_obj_set_size(row, w, 36);
+            lv_obj_set_pos(row, 0, 48 + i * 40);
+            lv_obj_set_style_radius(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x2F6FED), 0);
+            lv_obj_set_style_bg_opa(row, (i == power_index_) ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_t* label = lv_label_create(row);
+            lv_label_set_text(label, texts[i]);
+            lv_obj_set_style_text_color(label, (i == power_index_) ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x9AA4AD), 0);
+            if (font != nullptr) {
+                lv_obj_set_style_text_font(label, font, 0);
+            }
+            lv_obj_align(label, LV_ALIGN_LEFT_MID, 22, 0);
+            power_items_[i] = row;
+        }
+
+        power_hint_label_ = lv_label_create(power_layer_);
+        lv_label_set_text(power_hint_label_, "L/R: Switch   M: Confirm");
+        lv_obj_set_style_text_color(power_hint_label_, lv_color_hex(0x8A939B), 0);
+        if (font != nullptr) {
+            lv_obj_set_style_text_font(power_hint_label_, font, 0);
+        }
+        lv_obj_align(power_hint_label_, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    void HidePowerPage() {
+        if (power_layer_ == nullptr) {
+            return;
+        }
+        DisplayLockGuard lock(display_);
+        lv_obj_delete(power_layer_);
+        power_layer_ = nullptr;
+        power_items_[0] = nullptr;
+        power_items_[1] = nullptr;
+        power_hint_label_ = nullptr;
+        power_index_ = 0;
+    }
+
+    void SelectPowerItem(int index) {
+        if (power_layer_ == nullptr || index == power_index_) {
+            return;
+        }
+        power_index_ = index;
+        DisplayLockGuard lock(display_);
+        for (int i = 0; i < 2; i++) {
+            if (power_items_[i] == nullptr) {
+                continue;
+            }
+            lv_obj_set_style_bg_opa(power_items_[i], (i == power_index_) ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_t* label = lv_obj_get_child(power_items_[i], 0);
+            if (label != nullptr) {
+                lv_obj_set_style_text_color(label, (i == power_index_) ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x9AA4AD), 0);
+            }
+        }
     }
     // ---------------- Wireless mic (MicYou protocol) ----------------
     // Windows side: MicYou (https://github.com/LanRhyme/MicYou) listens on
@@ -654,6 +917,7 @@ private:
         while (true) {
             int r = recv(sock, (char*)tmp, sizeof(tmp), 0);
             if (r == 0) {
+                ESP_LOGW(TAG, "MicYou server closed the connection");
                 return false;
             }
             if (r < 0) {
@@ -737,6 +1001,37 @@ private:
     }
 
     void MicTaskRun() {
+        int attempt = 0;
+        while (!mic_task_stop_) {
+            if (attempt > 0) {
+                ESP_LOGW(TAG, "Mic link lost, auto-reconnecting (attempt %d)", attempt + 1);
+                MicSetStatus("Reconnecting...");
+                for (int i = 0; i < 15 && !mic_task_stop_; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
+            // MicRunSession returns false when the link broke mid-session
+            if (MicRunSession() || mic_task_stop_) {
+                break;
+            }
+            if (++attempt >= 3) {
+                MicSetStatus("Disconnected, M: retry");
+                break;
+            }
+        }
+        // Restore the audio engine once, at the very end
+        if (mic_engine_muted_) {
+            Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
+            mic_engine_muted_ = false;
+        }
+        mic_streaming_ = false;
+        ESP_LOGI(TAG, "Mic task exited");
+    }
+
+    // One full MicYou session: mDNS discovery -> TCP handshake -> stream/idle
+    // loop. Returns true when ended by request (mic_task_stop_), false when
+    // the link broke so MicTaskRun can retry the connection automatically.
+    bool MicRunSession() {
         int sock = -1;
         bool connected = false;
 
@@ -867,7 +1162,7 @@ private:
                 }
                 std::vector<int16_t> data;
                 if (Application::GetInstance().GetAudioService().ReadAudioData(data, 16000, 320)) {
-                    const int16_t* pcm = data.data();
+                    int16_t* pcm = data.data();
                     size_t nsamples = data.size();
                     std::vector<int16_t> mono;
                     if (GetAudioCodec()->input_channels() == 2) {
@@ -877,6 +1172,10 @@ private:
                         }
                         pcm = mono.data();
                         nsamples = mono.size();
+                    }
+                    if (MicNowMs() < mic_mute_until_ms_.load()) {
+                        // Button-press mute window: send silence instead of the click
+                        memset(pcm, 0, nsamples * sizeof(int16_t));
                     }
                     int32_t peak = 0;
                     for (size_t i = 0; i < nsamples; i++) {
@@ -888,11 +1187,13 @@ private:
                     size_t flen = MicBuildAudioFrame(mic_frame_buf_, sizeof(mic_frame_buf_),
                                                      (const uint8_t*)pcm, nsamples * sizeof(int16_t));
                     if (flen == 0 || MicSendAll(sock, mic_frame_buf_, flen) != 0) {
-                        MicSetStatus("Send failed, M: retry");
+                        ESP_LOGW(TAG, "Mic audio send failed: errno=%d", errno);
+                        connected = false;
                         break;
                     }
                     if (!MicDrainRx(sock)) {
-                        MicSetStatus("Disconnected, M: retry");
+                        ESP_LOGW(TAG, "Mic RX error while streaming");
+                        connected = false;
                         break;
                     }
                 } else {
@@ -901,7 +1202,8 @@ private:
             } else {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 if (!MicDrainRx(sock)) {
-                    MicSetStatus("Disconnected, M: retry");
+                    ESP_LOGW(TAG, "Mic RX error while idle");
+                    connected = false;
                     break;
                 }
                 int64_t now = MicNowMs();
@@ -909,37 +1211,188 @@ private:
                     last_ping_ms = now;
                     size_t flen = MicBuildTimestampFrame(mic_frame_buf_, sizeof(mic_frame_buf_), 0x2A, now);
                     if (flen == 0 || MicSendAll(sock, mic_frame_buf_, flen) != 0) {
-                        MicSetStatus("Disconnected, M: retry");
+                        ESP_LOGW(TAG, "Mic keepalive send failed: errno=%d", errno);
+                        connected = false;
                         break;
                     }
                 }
             }
         }
 
-        // 4. Cleanup
+        // 4. Close the socket; MicTaskRun decides whether to retry
         if (sock >= 0) {
             close(sock);
         }
-        if (mic_engine_muted_) {
-            Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
-            mic_engine_muted_ = false;
+        return mic_task_stop_;
+    }
+
+    // ---------------- Key-press sound cues ----------------
+    // Button clicks travel through the chassis into the microphone. While
+    // streaming, zero the outgoing audio for a short window after each press
+    // so the vibration is neither streamed to the PC nor drawn on the level
+    // waveform. Arm the window from OnPressDown (not OnClick) because the
+    // click noise happens at press-down, before click is even detected.
+    void MicMuteFor(int64_t ms) {
+        int64_t until = MicNowMs() + ms;
+        if (mic_mute_until_ms_.load() < until) {
+            mic_mute_until_ms_.store(until);
         }
-        mic_streaming_ = false;
-        ESP_LOGI(TAG, "Mic task exited");
+        mic_level_.store(0);
+    }
+
+    // Short UI cues synthesized at runtime and written straight to the codec
+    // as mono PCM at the codec output rate. A cue is a list of segments; each
+    // segment is a percussive tone gliding exponentially from freq_start to
+    // freq_end (equal = steady note) with a fast attack and decaying tail.
+    struct MicCueSegment {
+        float freq_start;
+        float freq_end;
+        uint16_t duration_ms;
+        float gain;
+    };
+
+    // M key, start streaming: rising major-triad arpeggio C6-E6-G6 ("on")
+    static constexpr MicCueSegment kMicCueStart[] = {
+        {1046.5f, 1046.5f, 55, 0.65f},
+        {1318.5f, 1318.5f, 55, 0.65f},
+        {1568.0f, 1568.0f, 140, 0.70f},
+    };
+    // M key, stop streaming: falling triad G6-E6-C6 ("off")
+    static constexpr MicCueSegment kMicCueStop[] = {
+        {1568.0f, 1568.0f, 55, 0.60f},
+        {1318.5f, 1318.5f, 55, 0.60f},
+        {1046.5f, 1046.5f, 150, 0.65f},
+    };
+    // Right key, send text (= PC Enter): quick upward whoosh-pop
+    static constexpr MicCueSegment kMicCueSend[] = {
+        {900.0f, 2400.0f, 80, 0.55f},
+    };
+    // Long-press left, leave the page: soft downward glide
+    static constexpr MicCueSegment kMicCueExit[] = {
+        {1200.0f, 480.0f, 170, 0.50f},
+    };
+
+    void PlayMicCue(const MicCueSegment* segments, size_t count) {
+        auto codec = GetAudioCodec();
+        bool resume_output = !codec->output_enabled();
+        if (resume_output) {
+            codec->EnableOutput(true);
+        }
+        const int sample_rate = codec->output_sample_rate();
+        const int chunk_samples = sample_rate / 50; // 20 ms chunks
+        std::vector<int16_t> pcm(chunk_samples);
+
+        // Brief silence to mask the PA power-up click
+        memset(pcm.data(), 0, pcm.size() * sizeof(int16_t));
+        codec->OutputData(pcm);
+
+        double phase = 0.0;
+        for (size_t s = 0; s < count; s++) {
+            const MicCueSegment& seg = segments[s];
+            int total = sample_rate * seg.duration_ms / 1000;
+            int attack = std::min(sample_rate * 6 / 1000, total / 5);
+            int offset = 0;
+            while (offset < total) {
+                int n = std::min(chunk_samples, total - offset);
+                for (int i = 0; i < n; i++) {
+                    float t = (float)(offset + i) / total;
+                    float freq = seg.freq_start * powf(seg.freq_end / seg.freq_start, t);
+                    phase += 2.0 * M_PI * freq / sample_rate;
+                    int pos = offset + i;
+                    float env = pos < attack
+                        ? (float)pos / attack
+                        : expf(-4.0f * (pos - attack) / (float)(total - attack));
+                    float v = sinf((float)phase) + 0.25f * sinf((float)phase * 2) + 0.1f * sinf((float)phase * 3);
+                    pcm[i] = (int16_t)(v * env * seg.gain * 20000.0f);
+                }
+                pcm.resize(n);
+                codec->OutputData(pcm);
+                offset += n;
+            }
+        }
+
+        if (resume_output) {
+            // Let the DMA tail drain before cutting the PA, else the cue is truncated
+            int drain_ms = AUDIO_CODEC_DMA_DESC_NUM * AUDIO_CODEC_DMA_FRAME_NUM * 1000 / sample_rate + 20;
+            vTaskDelay(pdMS_TO_TICKS(drain_ms));
+            codec->EnableOutput(false);
+        }
+    }
+
+    // Button callbacks (OnPressDown/OnClick/OnLongPress) run on the esp_timer
+    // task, and it is shared by ALL buttons plus every other timer in the
+    // system. Blocking it with I2S writes stalls button scanning (press
+    // events get detected late -> mute window opens too late) and the timers
+    // behind the LVGL tick (waveform freezes). So cues are requested here and
+    // synthesized on a dedicated low-priority task instead.
+    enum MicCueId { kCueStart = 0, kCueStop, kCueSend, kCueExit };
+    static constexpr const MicCueSegment* kMicCueTable[] = {
+        kMicCueStart, kMicCueStop, kMicCueSend, kMicCueExit,
+    };
+    static constexpr size_t kMicCueCount[] = {
+        sizeof(kMicCueStart) / sizeof(kMicCueStart[0]),
+        sizeof(kMicCueStop) / sizeof(kMicCueStop[0]),
+        sizeof(kMicCueSend) / sizeof(kMicCueSend[0]),
+        sizeof(kMicCueExit) / sizeof(kMicCueExit[0]),
+    };
+
+    void RequestMicCue(int cue) {
+        mic_cue_request_.store(cue);
+        if (mic_cue_task_handle_ == nullptr) {
+            mic_cue_task_stop_ = false;
+            mic_cue_task_handle_ = nullptr;
+            if (xTaskCreate(MicCueTaskEntry, "box0_cue", 4096, this, 3, &mic_cue_task_handle_) != pdPASS) {
+                mic_cue_task_handle_ = nullptr;
+                ESP_LOGW(TAG, "cue task create failed (out of memory?)");
+            }
+        }
+    }
+
+    static void MicCueTaskEntry(void* arg) {
+        static_cast<atk_dnesp32s3_box0*>(arg)->MicCueTask();
+    }
+
+    void MicCueTask() {
+        while (true) {
+            int cue = mic_cue_request_.exchange(-1);
+            if (cue >= 0) {
+                PlayMicCue(kMicCueTable[cue], kMicCueCount[cue]);
+                continue;
+            }
+            if (mic_cue_task_stop_) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        mic_cue_task_handle_ = nullptr;
+        vTaskDelete(nullptr);
     }
 
     void ToggleMicStreaming() {
         if (mic_task_handle_ == nullptr) {
             // (Re)connect to the desktop
+            RequestMicCue(kCueStart);
             mic_task_stop_ = false;
             mic_streaming_ = false;
             mic_rx_len_ = 0;
             xTaskCreate(MicTaskEntry, "box0_mic", 8192, this, 5, &mic_task_handle_);
             return;
         }
-        mic_streaming_ = !mic_streaming_;
-        MicSetStatus(mic_streaming_ ? "Streaming..." : "Connected", mic_streaming_);
-        MicSignalPc(mic_streaming_ ? "VOICE_START" : "VOICE_STOP");
+        if (!mic_streaming_) {
+            // The cue now plays asynchronously; keep the mic muted long enough
+            // to cover the cue so neither the press click nor the cue itself
+            // is streamed to the PC
+            MicMuteFor(500);
+            RequestMicCue(kCueStart);
+            mic_streaming_ = true;
+            MicSetStatus("Streaming...", true);
+            MicSignalPc("VOICE_START");
+        } else {
+            mic_streaming_ = false;
+            MicSetStatus("Connected", false);
+            MicSignalPc("VOICE_STOP");
+            RequestMicCue(kCueStop);
+        }
     }
 
     // Notify the PC-side voice_link helper over UDP so it can press the
@@ -1091,6 +1544,12 @@ private:
         for (int i = 0; i < 80 && mic_task_handle_ != nullptr; i++) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
+        // Stop the cue task; it finishes any pending cue (e.g. the exit sound)
+        // before honoring the flag.
+        mic_cue_task_stop_ = true;
+        for (int i = 0; i < 80 && mic_cue_task_handle_ != nullptr; i++) {
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
         if (mic_task_handle_ != nullptr) {
             ESP_LOGW(TAG, "Mic task did not stop in time, leaving it to exit");
         }
@@ -1159,7 +1618,81 @@ private:
     }
 
     void InitializeButtons() {
+        // Menu/page interactions fire on press-down (not on release) so the UI
+        // tracks the finger; *_press_consumed_ makes the matching release
+        // click a no-op. Mic-page press-down only mutes the chassis click.
+        middle_button_.OnPressDown([this]() {
+            if (mic_layer_ != nullptr) { MicMuteFor(250); }
+            m_press_consumed_ = false;
+            if (flappy_game_.IsActive() || dino_game_.IsActive()) {
+                return;
+            }
+            // First press just wakes the dimmed screen
+            if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
+                power_save_timer_->WakeUp();
+                power_sleep_ = kDeviceNoSleep;
+                m_press_consumed_ = true;
+                return;
+            }
+            if (power_layer_ != nullptr) {
+                StopNavRepeat();
+                ConfirmPowerItem();
+                m_press_consumed_ = true;
+                return;
+            }
+            if (menu_visible_) {
+                StopNavRepeat();
+                ActivateMenuItem();
+                m_press_consumed_ = true;
+            }
+        });
+        right_button_.OnPressDown([this]() {
+            if (mic_layer_ != nullptr) { MicMuteFor(250); }
+            nav_press_consumed_ = false;
+            if (flappy_game_.IsActive() || dino_game_.IsActive()) {
+                return;
+            }
+            // First press just wakes the dimmed screen
+            if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
+                power_save_timer_->WakeUp();
+                power_sleep_ = kDeviceNoSleep;
+                nav_press_consumed_ = true;
+                return;
+            }
+            if (NavSelection(1)) {
+                nav_press_consumed_ = true;
+                if (menu_visible_) {
+                    StartNavRepeat(1);
+                }
+            }
+        });
+        left_button_.OnPressDown([this]() {
+            if (mic_layer_ != nullptr) { MicMuteFor(250); }
+            nav_press_consumed_ = false;
+            if (flappy_game_.IsActive() || dino_game_.IsActive()) {
+                return;
+            }
+            // First press just wakes the dimmed screen
+            if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
+                power_save_timer_->WakeUp();
+                power_sleep_ = kDeviceNoSleep;
+                nav_press_consumed_ = true;
+                return;
+            }
+            if (NavSelection(-1)) {
+                nav_press_consumed_ = true;
+                if (menu_visible_) {
+                    StartNavRepeat(-1);
+                }
+            }
+        });
+
         middle_button_.OnClick([this]() {
+        if (m_press_consumed_) {
+            // Already handled on press-down; swallow the release.
+            m_press_consumed_ = false;
+            return;
+        }
         // First press just wakes the dimmed screen
         if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
             power_save_timer_->WakeUp();
@@ -1178,21 +1711,12 @@ private:
             ToggleMicStreaming();
             return;
         }
+        if (power_layer_ != nullptr) {
+            ConfirmPowerItem();
+            return;
+        }
         if (menu_visible_) {
-            if (menu_index_ == 0) {
-                HideBootMenu();
-            } else if (menu_index_ == 1) {
-                HideBootMenu();
-                ShowMicPage();
-            } else if (menu_index_ == 2) {
-                HideBootMenu();
-                StartGame();
-            } else if (menu_index_ == 3) {
-                HideBootMenu();
-                StartDinoGame();
-            } else {
-                ShowAboutPage();
-            }
+            ActivateMenuItem();
             return;
         }
         if (flappy_game_.IsActive() || dino_game_.IsActive()) {
@@ -1233,7 +1757,14 @@ private:
         });
 
         middle_button_.OnLongPress([this]() {
+            if (m_press_consumed_) {
+                // Menu/power item already activated on press-down.
+                return;
+            }
             if (mic_layer_ != nullptr) {
+                return;
+            }
+            if (power_layer_ != nullptr) {
                 return;
             }
             auto& app = Application::GetInstance();
@@ -1264,6 +1795,11 @@ private:
         });
 
         left_button_.OnClick([this]() {
+        if (nav_press_consumed_) {
+            // Navigation already happened on press-down; swallow the release.
+            nav_press_consumed_ = false;
+            return;
+        }
         // First press just wakes the dimmed screen
         if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
             power_save_timer_->WakeUp();
@@ -1277,11 +1813,15 @@ private:
             SelectAboutPage((about_page_ + kAboutPages - 1) % kAboutPages);
             return;
         }
+        if (power_layer_ != nullptr) {
+            SelectPowerItem((power_index_ + 1) % 2);
+            return;
+        }
         if (mic_layer_ != nullptr) {
             return;
         }
         if (menu_visible_) {
-            SelectMenuItem((menu_index_ + 4) % 5);
+            SelectMenuItem((menu_index_ + kMenuItemCount - 1) % kMenuItemCount);
             return;
         }
             if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
@@ -1300,6 +1840,7 @@ private:
 
         left_button_.OnLongPress([this]() {
             if (mic_layer_ != nullptr) {
+                RequestMicCue(kCueExit);
                 ExitMicPage();
                 return;
             }
@@ -1317,6 +1858,10 @@ private:
                 HideAboutPage();
                 return;
             }
+            if (power_layer_ != nullptr) {
+                HidePowerPage();
+                return;
+            }
             if (menu_visible_) {
                 return;
             }
@@ -1324,6 +1869,11 @@ private:
         });
 
         right_button_.OnClick([this]() {
+        if (nav_press_consumed_) {
+            // Navigation already happened on press-down; swallow the release.
+            nav_press_consumed_ = false;
+            return;
+        }
         // First press just wakes the dimmed screen
         if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
             power_save_timer_->WakeUp();
@@ -1337,13 +1887,18 @@ private:
             SelectAboutPage((about_page_ + 1) % kAboutPages);
             return;
         }
+        if (power_layer_ != nullptr) {
+            SelectPowerItem((power_index_ + 1) % 2);
+            return;
+        }
         if (mic_layer_ != nullptr) {
             // Confirm/send the recognized text: voice_link turns this into Enter
             MicSignalPc("VOICE_ENTER");
+            RequestMicCue(kCueSend);
             return;
         }
         if (menu_visible_) {
-            SelectMenuItem((menu_index_ + 1) % 5);
+            SelectMenuItem((menu_index_ + 1) % kMenuItemCount);
             return;
         }
             if (power_sleep_ == kDeviceNeutralSleep && LcdStatus_ != kDevicelcdbacklightOff) {
@@ -1360,6 +1915,10 @@ private:
         });
 
         right_button_.OnLongPress([this]() {
+            // Holding R scrolls the menu/pages now; don't max the volume there.
+            if (menu_visible_ || about_layer_ != nullptr || power_layer_ != nullptr) {
+                return;
+            }
             GetAudioCodec()->SetOutputVolume(100);
             GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
@@ -1428,7 +1987,18 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&menu_timer_args, &menu_timer_));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(menu_timer_, 500 * 1000));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(menu_timer_, 100 * 1000));
+
+        esp_timer_create_args_t nav_timer_args = {
+            .callback = [](void* arg) {
+                static_cast<atk_dnesp32s3_box0*>(arg)->NavRepeatTick();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "nav_repeat",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&nav_timer_args, &nav_repeat_timer_));
     }
 
     virtual AudioCodec* GetAudioCodec() override {
